@@ -99,12 +99,14 @@ class Signal(Base):
     side: Mapped[str] = mapped_column(String(4), nullable=False)  # BUY / SELL
     price: Mapped[float] = mapped_column(Float, nullable=False)
     size_usd: Mapped[float] = mapped_column(Float, nullable=False)
+    market_name: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
     raw_trade_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     detected_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
-    action_taken: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)  # copied / skipped / manual
+    action_taken: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)  # copied / skipped / manual / paper
     skip_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    strategies_triggered: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True)  # slugs of strategies that said yes
     strategy_id: Mapped[Optional[int]] = mapped_column(
         BigInteger, ForeignKey("strategies.id", ondelete="SET NULL"), nullable=True
     )

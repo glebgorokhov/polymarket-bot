@@ -21,7 +21,7 @@ from bot.handlers.commands import (
     cmd_report,
     cmd_resume,
     cmd_settings,
-    cmd_signal,
+    cmd_signals,
     cmd_start,
     cmd_status,
     cmd_strategy,
@@ -61,7 +61,7 @@ def create_app() -> Application:
     app.add_handler(CommandHandler("pause", cmd_pause))
     app.add_handler(CommandHandler("resume", cmd_resume))
     app.add_handler(CommandHandler("settings", cmd_settings))
-    app.add_handler(CommandHandler("signal", cmd_signal))
+    app.add_handler(CommandHandler("signals", cmd_signals))
     app.add_handler(CommandHandler("discover", cmd_discover))
     app.add_handler(CommandHandler("help", cmd_help))
 

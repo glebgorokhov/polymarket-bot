@@ -51,6 +51,19 @@ class SignalRepo:
         """Fetch a signal by primary key."""
         return await self._session.get(Signal, signal_id)
 
+    async def update_strategies_triggered(
+        self,
+        signal_id: int,
+        slugs: list[str],
+        market_name: Optional[str] = None,
+    ) -> None:
+        """Store the list of strategy slugs that triggered on this signal."""
+        signal = await self._session.get(Signal, signal_id)
+        if signal:
+            signal.strategies_triggered = slugs
+            if market_name:
+                signal.market_name = market_name
+
     async def update_action(
         self,
         signal_id: int,
@@ -62,6 +75,18 @@ class SignalRepo:
         if signal:
             signal.action_taken = action_taken
             signal.skip_reason = skip_reason
+
+    async def get_latest(self, limit: int = 20) -> Sequence[Signal]:
+        """Return the most recent N signals across all traders."""
+        from db.models import Trader
+        result = await self._session.execute(
+            select(Signal)
+            .join(Trader, Signal.trader_id == Trader.id)
+            .order_by(Signal.detected_at.desc())
+            .limit(limit)
+            .options(__import__('sqlalchemy.orm', fromlist=['joinedload']).joinedload(Signal.trader))
+        )
+        return result.scalars().all()
 
     async def get_recent(self, hours: int = 1) -> Sequence[Signal]:
         """Return signals detected in the past N hours."""

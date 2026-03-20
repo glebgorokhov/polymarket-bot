@@ -87,6 +87,51 @@ def trader_removed(trader: Any, reason: str) -> str:
     )
 
 
+def signal_detected_manual(signal: Any, triggered_slugs: list, market_name: str) -> str:
+    """
+    Notification for manual mode — lists all strategies that wanted to copy.
+    User can decide whether to act manually.
+    """
+    side_icon = "🔵" if signal.side == "BUY" else "🔴"
+    strat_lines = "\n".join(f"  · {slug}" for slug in triggered_slugs)
+    return (
+        f"⚠️ <b>Signal — manual review needed</b>\n"
+        f"\n"
+        f"{side_icon} <b>{market_name}</b>\n"
+        f"📈 {signal.side} @ <b>{signal.price:.4f}</b> · ${signal.size_usd:.2f}\n"
+        f"\n"
+        f"Triggered by {len(triggered_slugs)} {'strategy' if len(triggered_slugs) == 1 else 'strategies'}:\n"
+        f"{strat_lines}\n"
+        f"\n"
+        f"Switch to /mode paper or /mode auto to let me handle this."
+    )
+
+
+def trade_opened_multi(position: Any, triggered_slugs: list, mode: str) -> str:
+    """
+    Notification when a position is opened, showing all strategies that triggered.
+    """
+    mode_icon = "✅" if mode == "auto" else "📄"
+    mode_label = "Trade placed" if mode == "auto" else "Paper trade"
+    shadow_count = len(triggered_slugs) - 1
+    primary_slug = triggered_slugs[0] if triggered_slugs else "unknown"
+
+    shadow_note = (
+        f"\n👁️ {shadow_count} more {'strategy' if shadow_count == 1 else 'strategies'} shadow-tracking: "
+        + ", ".join(triggered_slugs[1:])
+        if shadow_count > 0 else ""
+    )
+
+    return (
+        f"{mode_icon} <b>{mode_label}</b>\n"
+        f"\n"
+        f"🏪 {position.market_name}\n"
+        f"📈 {position.side} @ {position.entry_price:.4f} · ${position.size_usd:.2f}\n"
+        f"🎯 Primary: <b>{primary_slug}</b>{shadow_note}\n"
+        f"🆔 Position #{position.id}"
+    )
+
+
 def signal_detected(signal: Any, action: str, skip_reason: Optional[str] = None) -> str:
     """
     Format a message for a detected trade signal.

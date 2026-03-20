@@ -35,14 +35,18 @@ async def execute_copy_trade(signal: Signal, mode: str) -> None:
     """
     Evaluate ALL active strategies for this signal simultaneously.
 
-    - Primary strategy (active_strategy_slug setting): places real or paper trade
-    - All other active strategies: run as shadow simulations (is_shadow=True)
+    Behaviour by mode:
+    - auto:   Primary strategy places real order. Others create shadow positions.
+    - paper:  Primary strategy creates paper position (no real order). Others shadow.
+    - manual: No positions created. ONE notification sent listing all strategies
+              that wanted to copy. User decides manually.
 
-    This lets us compare strategy performance over time.
+    In every mode, if ANY strategy triggers, a notification is sent listing which
+    strategies fired and the market/side/price details.
 
     Args:
-        signal: Validated Signal ORM object (may have extra attrs from monitor).
-        mode: "auto", "manual", or "paper".
+        signal: Validated Signal ORM object.
+        mode: "auto", "paper", or "manual".
     """
     from core.strategies import get_all_active_strategies
 
@@ -53,7 +57,7 @@ async def execute_copy_trade(signal: Signal, mode: str) -> None:
         settings = await settings_repo.as_dict()
         primary_slug = await settings_repo.get("active_strategy_slug", "consensus")
 
-    # Get balance once
+    # Get balance
     clob_client = _get_clob_client()
     try:
         balance = await clob_client.get_balance()
@@ -64,25 +68,23 @@ async def execute_copy_trade(signal: Signal, mode: str) -> None:
     per_trade_pct = float(settings.get("budget_per_trade_pct", cfg.default_per_trade_pct))
     max_trade_usd = float(settings.get("max_trade_usd", cfg.default_max_trade_usd))
 
-    # Get all active strategies
     all_strategies = await get_all_active_strategies()
     if not all_strategies:
         logger.warning("No active strategies found")
         return
 
-    # Get shared context
+    # Shared context for all strategies
     async with get_session() as session:
         signal_repo = SignalRepo(session)
         recent_signals = list(await signal_repo.get_recent(hours=1))
         position_repo = PositionRepo(session)
         open_positions = list(await position_repo.get_open())
 
-    primary_acted = False
-    order_id: Optional[str] = None
+    market_name = getattr(signal, "market_name", None) or signal.market_condition_id
 
+    # ── Pass 1: evaluate all strategies, collect those that say YES ──────────
+    triggered: list[tuple[Any, Any, float]] = []  # (strat_orm, strategy, trade_size)
     for strat_orm, strategy in all_strategies:
-        is_primary = (strat_orm.slug == primary_slug)
-
         try:
             should_copy, conviction = await strategy.should_copy(
                 signal=signal,
@@ -90,18 +92,11 @@ async def execute_copy_trade(signal: Signal, mode: str) -> None:
                 open_positions=open_positions,
             )
         except Exception as exc:
-            logger.error("Strategy %s error in should_copy: %s", strat_orm.slug, exc)
+            logger.error("Strategy %s error: %s", strat_orm.slug, exc)
             continue
 
         if not should_copy:
             logger.debug("Strategy %s declined signal %s", strat_orm.slug, signal.id)
-            if is_primary:
-                async with get_session() as session:
-                    await SignalRepo(session).update_action(
-                        signal.id, "skipped", f"strategy_{strat_orm.slug}_declined"
-                    )
-                from bot.notifications import signal_detected, send_notification
-                await send_notification(signal_detected(signal, "skipped", f"{strat_orm.slug} declined"))
             continue
 
         trade_size = risk.calculate_trade_size(
@@ -113,7 +108,42 @@ async def execute_copy_trade(signal: Signal, mode: str) -> None:
         if trade_size < 1.0:
             continue
 
-        # Risk check (skip for shadow trades — they're virtual)
+        triggered.append((strat_orm, strategy, trade_size))
+
+    if not triggered:
+        # No strategy fired — mark skipped silently
+        async with get_session() as session:
+            await SignalRepo(session).update_action(signal.id, "skipped", "no_strategy_triggered")
+        logger.debug("Signal %s: no strategy triggered", signal.id)
+        return
+
+    triggered_slugs = [strat_orm.slug for strat_orm, _, _ in triggered]
+    logger.info(
+        "Signal %s: %d strategies triggered (%s) — mode=%s",
+        signal.id, len(triggered_slugs), ", ".join(triggered_slugs), mode,
+    )
+
+    # Store triggered strategy slugs on signal
+    async with get_session() as session:
+        await SignalRepo(session).update_strategies_triggered(signal.id, triggered_slugs, market_name)
+
+    # ── Manual mode: notify and stop — user decides ──────────────────────────
+    if mode == "manual":
+        async with get_session() as session:
+            await SignalRepo(session).update_action(signal.id, "manual")
+        from bot.notifications import signal_detected_manual, send_notification
+        await send_notification(signal_detected_manual(signal, triggered_slugs, market_name))
+        return
+
+    # ── Auto / paper: create positions ───────────────────────────────────────
+    order_id: Optional[str] = None
+    primary_position: Optional[Position] = None
+
+    for strat_orm, strategy, trade_size in triggered:
+        is_primary = (strat_orm.slug == primary_slug)
+        shares = trade_size / signal.price if signal.price > 0 else 0
+
+        # Risk check only for primary
         if is_primary:
             ok, risk_reason = await risk.check_risk_limits(
                 market_condition_id=signal.market_condition_id,
@@ -123,18 +153,13 @@ async def execute_copy_trade(signal: Signal, mode: str) -> None:
                 settings=settings,
             )
             if not ok:
-                logger.info("Risk check failed for primary strategy: %s", risk_reason)
+                logger.info("Risk check failed for primary: %s", risk_reason)
                 async with get_session() as session:
                     await SignalRepo(session).update_action(signal.id, "skipped", f"risk:{risk_reason}")
                 from bot.notifications import risk_alert, send_notification
                 await send_notification(risk_alert("risk_limit", risk_reason))
-                continue
+                is_primary = False  # fall through as shadow
 
-        market_name = getattr(signal, "market_name", signal.market_condition_id)
-        shares = trade_size / signal.price if signal.price > 0 else 0
-
-        # For primary strategy, place real/paper order
-        _is_primary_for_position = is_primary  # track whether this position is real
         if is_primary and mode == "auto":
             try:
                 order_result = await clob_client.place_market_order(
@@ -145,30 +170,17 @@ async def execute_copy_trade(signal: Signal, mode: str) -> None:
                 order_id = order_result.get("orderID", order_result.get("id", f"order_{signal.id}"))
                 filled_price = float(order_result.get("price", signal.price) or signal.price)
                 shares = trade_size / filled_price if filled_price > 0 else shares
-                logger.info(
-                    "Order placed: %s %s size=%.2f order_id=%s",
-                    signal.side, signal.token_id, trade_size, order_id,
-                )
+                logger.info("Order placed: %s %s size=%.2f id=%s", signal.side, signal.token_id, trade_size, order_id)
             except Exception as exc:
                 logger.error("Order placement failed: %s", exc)
                 from bot.notifications import error_alert, send_notification
                 await send_notification(error_alert(str(exc)))
-                continue
-        elif is_primary and mode == "manual":
-            async with get_session() as session:
-                await SignalRepo(session).update_action(signal.id, "manual")
-            from bot.notifications import signal_detected, send_notification
-            await send_notification(signal_detected(signal, "manual", "Awaiting manual decision"))
-            # Treat as shadow for position creation; other strategies still shadow-simulate
-            _is_primary_for_position = False
+                is_primary = False  # save as shadow on failure
 
-        # Create position record (real or shadow)
-        is_shadow_position = not (_is_primary_for_position and mode in ("auto", "paper"))
-
+        is_shadow = not is_primary
         async with get_session() as session:
             position_repo = PositionRepo(session)
             execution_repo = ExecutionRepo(session)
-
             position = await position_repo.create(
                 market_condition_id=signal.market_condition_id,
                 token_id=signal.token_id,
@@ -180,14 +192,10 @@ async def execute_copy_trade(signal: Signal, mode: str) -> None:
                 strategy_id=strat_orm.id,
                 signal_id=signal.id,
                 entry_cost=trade_size,
-                is_shadow=is_shadow_position,
+                is_shadow=is_shadow,
             )
-            if not is_shadow_position:
-                _order_id = (
-                    f"paper_{signal.id}" if mode == "paper"
-                    else order_id if mode == "auto"
-                    else f"manual_{signal.id}"
-                )
+            if not is_shadow:
+                _order_id = order_id if mode == "auto" else f"paper_{signal.id}"
                 await execution_repo.create(
                     position_id=position.id,
                     side=signal.side,
@@ -196,31 +204,26 @@ async def execute_copy_trade(signal: Signal, mode: str) -> None:
                     order_id=_order_id,
                     fee=0.0,
                 )
+            if is_primary:
+                primary_position = position
 
-        if _is_primary_for_position:
-            primary_acted = True
-            async with get_session() as session:
-                await SignalRepo(session).update_action(signal.id, "copied")
-            from bot.notifications import trade_opened, send_notification
-            await send_notification(trade_opened(position, strat_orm.slug))
-            logger.info("Position created: id=%d market=%s strategy=%s", position.id, market_name, strat_orm.slug)
-        else:
-            logger.info(
-                "Shadow position created for strategy %s: %s %s",
-                strat_orm.slug, signal.side, market_name,
-            )
+        tag = "primary" if is_primary else f"shadow/{strat_orm.slug}"
+        logger.info("Position %d [%s] %s %s @ %.4f", position.id, tag, signal.side, market_name[:40], signal.price)
 
-    if not primary_acted and mode != "manual":
-        # No strategy acted as primary — mark signal skipped
-        async with get_session() as session:
-            sig = await SignalRepo(session).get_by_id(signal.id)
-            if sig and not sig.action_taken:
-                await SignalRepo(session).update_action(signal.id, "skipped", "no_strategy_triggered")
+    # Mark signal action
+    action = "copied" if mode == "auto" else "paper"
+    async with get_session() as session:
+        await SignalRepo(session).update_action(signal.id, action)
+
+    # One consolidated notification
+    if primary_position:
+        from bot.notifications import trade_opened_multi, send_notification
+        await send_notification(trade_opened_multi(primary_position, triggered_slugs, mode))
 
 
 async def close_position(position: Position, reason: str) -> None:
     """
-    Close an open position: cancel order, record exit, notify.
+    Close an open position: record exit, notify.
 
     Args:
         position: Open Position ORM object to close.
@@ -228,14 +231,13 @@ async def close_position(position: Position, reason: str) -> None:
     """
     clob_client = _get_clob_client()
 
-    current_price: Optional[float] = None
     try:
         current_price = await clob_client.get_midpoint(token_id=position.token_id)
     except Exception as exc:
         logger.warning("Failed to get midpoint for close: %s", exc)
         current_price = position.current_price or position.entry_price
 
-    if current_price is None or current_price <= 0:
+    if not current_price or current_price <= 0:
         current_price = position.entry_price
 
     exit_value = (position.shares or 0) * current_price
@@ -257,26 +259,15 @@ async def close_position(position: Position, reason: str) -> None:
                 fee=0.0,
             )
 
-    logger.info(
-        "Position %d closed: reason=%s exit_value=%.2f",
-        position.id,
-        reason,
-        exit_value,
-    )
+    logger.info("Position %d closed: reason=%s exit_value=%.2f", position.id, reason, exit_value)
 
     if updated_position:
-        from bot import notifications as notif
-        from bot.notifications import trade_closed
-        await notif.send_notification(trade_closed(updated_position))
+        from bot.notifications import trade_closed, send_notification
+        await send_notification(trade_closed(updated_position))
 
 
 async def check_stop_losses() -> None:
-    """
-    Scan all open positions and close any that breach the stop-loss threshold.
-
-    Uses stop_loss_pct setting from DB. Positions are closed when
-    current PnL is worse than -stop_loss_pct% of entry cost.
-    """
+    """Scan all open positions and close any that breach the stop-loss threshold."""
     async with get_session() as session:
         settings_repo = SettingsRepo(session)
         stop_loss_pct = await settings_repo.get_float("stop_loss_pct", 35.0)
@@ -293,28 +284,18 @@ async def check_stop_losses() -> None:
             current_price = await clob_client.get_midpoint(token_id=position.token_id)
             if current_price is None:
                 continue
-
             entry_cost = position.entry_cost or position.size_usd
             current_value = (position.shares or 0) * current_price
             loss_pct = ((current_value - entry_cost) / entry_cost) * 100.0 if entry_cost > 0 else 0
-
             if loss_pct <= -stop_loss_pct:
-                logger.info(
-                    "Stop loss triggered for position %d (loss=%.1f%%)",
-                    position.id,
-                    loss_pct,
-                )
+                logger.info("Stop loss triggered for position %d (loss=%.1f%%)", position.id, loss_pct)
                 await close_position(position, reason=f"stop_loss_{abs(loss_pct):.1f}pct")
-
         except Exception as exc:
             logger.error("Error checking stop loss for position %d: %s", position.id, exc)
 
 
 async def update_position_prices() -> None:
-    """
-    Refresh current_price for all open positions from CLOB midpoint.
-    Also checks smart exit strategies for positions.
-    """
+    """Refresh current_price for all open positions from CLOB midpoint."""
     async with get_session() as session:
         settings_repo = SettingsRepo(session)
         settings = await settings_repo.as_dict()
@@ -332,9 +313,7 @@ async def update_position_prices() -> None:
     if active_strategy_orm:
         from core.strategies import get_strategy
         try:
-            strategy = get_strategy(
-                active_strategy_orm.slug, active_strategy_orm.params or {}
-            )
+            strategy = get_strategy(active_strategy_orm.slug, active_strategy_orm.params or {})
         except ValueError:
             pass
 
@@ -343,22 +322,15 @@ async def update_position_prices() -> None:
             current_price = await clob_client.get_midpoint(token_id=position.token_id)
             if current_price is None:
                 continue
-
             async with get_session() as session:
-                position_repo = PositionRepo(session)
-                await position_repo.update_current_price(position.id, current_price)
-
-            # Run strategy exit check
+                await PositionRepo(session).update_current_price(position.id, current_price)
             if strategy:
                 should_exit, exit_reason = await strategy.should_exit(
                     position=position,
                     current_price=current_price,
-                    original_trader_exited=False,  # No direct exit signal
+                    original_trader_exited=False,
                 )
                 if should_exit:
                     await close_position(position, reason=exit_reason)
-
         except Exception as exc:
-            logger.error(
-                "Error updating price for position %d: %s", position.id, exc
-            )
+            logger.error("Error updating price for position %d: %s", position.id, exc)

@@ -526,32 +526,39 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
-async def cmd_signal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Handle /signal <address>. Shows last 5 signals from a specific trader.
+    Handle /signals. Shows last 20 signals across all tracked traders.
     """
     if not _is_admin(update):
         return
-    args = context.args or []
-    if not args:
-        await update.message.reply_text("Usage: /signal <trader_address>")
-        return
 
-    address = args[0]
     async with get_session() as session:
         signal_repo = SignalRepo(session)
-        signals = list(await signal_repo.get_by_address(address, limit=5))
+        signals = list(await signal_repo.get_latest(limit=20))
 
     if not signals:
-        await update.message.reply_text(f"No signals found for address {address[:12]}...")
+        await update.message.reply_text("📭 No signals yet. Run /discover to find traders.")
         return
 
-    lines = [f"📡 <b>Last {len(signals)} signals from</b> <code>{address[:12]}...</code>\n"]
+    lines = [f"📡 <b>Last {len(signals)} signals</b>\n"]
     for sig in signals:
-        ts = sig.detected_at.strftime("%m/%d %H:%M") if sig.detected_at else "N/A"
-        action_icon = {"copied": "✅", "skipped": "⏭️", "manual": "⚠️"}.get(sig.action_taken or "", "❓")
+        ts = sig.detected_at.strftime("%m/%d %H:%M") if sig.detected_at else "—"
+        action_icon = {"copied": "✅", "paper": "📄", "skipped": "⏭️", "manual": "⚠️"}.get(
+            sig.action_taken or "", "❓"
+        )
+        trader = sig.trader if hasattr(sig, "trader") and sig.trader else None
+        trader_name = (
+            (trader.display_name or trader.address[:10] + "…") if trader else "unknown"
+        )
+        strategies_hit = sig.strategies_triggered or []
+        strat_str = " · ".join(strategies_hit) if strategies_hit else "—"
+        market_short = (sig.market_name or sig.market_condition_id or "")[:35]
+        side_icon = "🔵" if sig.side == "BUY" else "🔴"
         lines.append(
-            f"{action_icon} {sig.side} @ {sig.price:.4f} | ${sig.size_usd:.2f} | {ts}"
+            f"{action_icon} {side_icon} <b>{market_short}</b>\n"
+            f"   {trader_name} · {sig.side} @ {sig.price:.4f} · ${sig.size_usd:.2f}\n"
+            f"   Strategies: {strat_str} · {ts}"
         )
 
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
@@ -604,7 +611,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/history [n] — Last N closed positions\n"
         "/strategy list — All strategies + 7d P&L\n"
         "/strategy use &lt;slug&gt; — Switch strategy\n"
-        "/signal &lt;address&gt; — Last 5 signals from trader\n"
+        "/signals — Last 20 signals across all tracked traders\n"
         "/report — Generate full report\n"
         "/settings — Show all settings\n"
         "/help — This message"
