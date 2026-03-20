@@ -147,15 +147,19 @@ class DataApiClient:
         """
         Fetch ALL trades for a user by paginating through the full history.
 
+        The Data API hard-caps offset at 3000 (returns 400 beyond that).
+        Max retrievable trades = 3000 + one final page = up to ~3500.
+
         Args:
             user: On-chain wallet address.
 
         Returns:
-            Complete list of trade dicts, oldest to newest.
+            Complete list of trade dicts, newest first.
         """
         all_trades: list[dict] = []
         offset = 0
         page_size = 500
+        _MAX_OFFSET = 3000  # API hard ceiling — 400 error beyond this
         while True:
             batch = await self.get_trades(user=user, limit=page_size, offset=offset)
             if not batch:
@@ -164,10 +168,9 @@ class DataApiClient:
             if len(batch) < page_size:
                 break  # Last page
             offset += page_size
-            if offset >= 10000:  # API hard ceiling
-                logger.warning("Hit 10k trade offset ceiling for user %s (%d trades)", user, len(all_trades))
-                break
-            await asyncio.sleep(0.1)  # Be respectful
+            if offset >= _MAX_OFFSET:
+                break  # Would get 400 on next page
+            await asyncio.sleep(0.05)  # Be respectful
         return all_trades
 
     async def get_positions(self, user: str) -> list[dict]:

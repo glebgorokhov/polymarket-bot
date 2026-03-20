@@ -66,6 +66,8 @@ def create_app() -> Application:
     app.add_handler(CommandHandler("signals", cmd_signals))
     app.add_handler(CommandHandler("track", cmd_track))
     app.add_handler(CommandHandler("untrack", cmd_untrack))
+    app.add_handler(CommandHandler("track", cmd_track))
+    app.add_handler(CommandHandler("untrack", cmd_untrack))
     app.add_handler(CommandHandler("discover", cmd_discover))
     app.add_handler(CommandHandler("help", cmd_help))
 
