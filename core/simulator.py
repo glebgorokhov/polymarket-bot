@@ -40,8 +40,8 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-_GAMMA_BASE = "https://gamma-api.polymarket.com"
-_BATCH_SIZE = 20
+_CLOB_BASE = "https://clob.polymarket.com"
+_CONCURRENCY = 30  # max simultaneous CLOB requests
 
 # Strategy parameters
 WHALE_THRESHOLD = 0.05          # ≥5% of implied portfolio
@@ -154,49 +154,70 @@ class FullSimResult:
 
 
 # ---------------------------------------------------------------------------
-# Gamma API
+# CLOB API — market resolution data
 # ---------------------------------------------------------------------------
+# NOTE: gamma-api.polymarket.com/markets?conditionIds=X ignores the param
+# and returns 20 random markets. The correct approach is the CLOB path endpoint:
+# clob.polymarket.com/markets/{conditionId} — returns single market with
+# tokens[].winner=True/False for resolved markets.
 
-async def _fetch_market_batch(condition_ids: list[str]) -> list[dict]:
-    if not condition_ids:
-        return []
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            params = [("conditionIds", cid) for cid in condition_ids]
-            resp = await client.get(f"{_GAMMA_BASE}/markets", params=params)
-            resp.raise_for_status()
-            data = resp.json()
-            return data if isinstance(data, list) else []
-    except Exception as exc:
-        logger.warning("gamma batch fetch failed: %s", exc)
-        return []
+async def _fetch_clob_market(
+    client: httpx.AsyncClient,
+    condition_id: str,
+    sem: asyncio.Semaphore,
+) -> Optional[dict]:
+    async with sem:
+        try:
+            resp = await client.get(
+                f"{_CLOB_BASE}/markets/{condition_id}",
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception as exc:
+            logger.debug("clob market fetch failed for %s: %s", condition_id[:10], exc)
+    return None
 
 
 async def get_market_info(condition_ids: list[str]) -> dict[str, MarketInfo]:
+    """Fetch market resolution data from CLOB for a list of conditionIds."""
     results: dict[str, MarketInfo] = {}
-    for i in range(0, len(condition_ids), _BATCH_SIZE):
-        batch = condition_ids[i : i + _BATCH_SIZE]
-        markets = await _fetch_market_batch(batch)
-        for m in markets:
-            cid = m.get("conditionId", "")
-            if not cid:
-                continue
-            closed = bool(m.get("closed", False))
-            raw_prices = m.get("outcomePrices", [])
-            prices: list[float] = []
-            for p in raw_prices:
+    sem = asyncio.Semaphore(_CONCURRENCY)
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        tasks = [_fetch_clob_market(client, cid, sem) for cid in condition_ids]
+        raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for cid, raw in zip(condition_ids, raw_results):
+        if not raw or isinstance(raw, Exception):
+            continue
+        if not isinstance(raw, dict):
+            continue
+
+        closed = bool(raw.get("closed", False))
+
+        # Build outcome_prices from tokens array
+        # winner=True → 1.0, winner=False → 0.0 (for resolved markets)
+        # For open markets, use current price
+        tokens = raw.get("tokens") or []
+        prices: list[float] = []
+        for tok in tokens:
+            if closed:
+                prices.append(1.0 if tok.get("winner") else 0.0)
+            else:
                 try:
-                    prices.append(float(p))
+                    prices.append(float(tok.get("price", 0) or 0))
                 except (ValueError, TypeError):
                     prices.append(0.0)
-            results[cid] = MarketInfo(
-                condition_id=cid,
-                title=m.get("question") or m.get("title") or "?",
-                closed=closed,
-                outcome_prices=prices,
-            )
-        if len(condition_ids) > _BATCH_SIZE:
-            await asyncio.sleep(0.15)
+
+        results[cid] = MarketInfo(
+            condition_id=cid,
+            title=raw.get("question") or raw.get("market_slug") or "?",
+            closed=closed,
+            outcome_prices=prices,
+        )
+
+    logger.info("Fetched CLOB market data: %d/%d resolved", sum(1 for m in results.values() if m.closed), len(results))
     return results
 
 
