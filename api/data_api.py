@@ -173,6 +173,25 @@ class DataApiClient:
             await asyncio.sleep(0.05)  # Be respectful
         return all_trades
 
+    async def get_top_markets(self, limit: int = 50) -> list[dict]:
+        """
+        Fetch top markets by volume from the Gamma API.
+        Used for market-level trader discovery.
+        """
+        import urllib.request as _urllib
+        url = f"https://gamma-api.polymarket.com/markets?closed=false&limit={limit}&order=volumeNum&ascending=false"
+        req = _urllib.Request(url, headers={"User-Agent": "polymarket-bot/1.0"})
+        try:
+            import json as _json
+            loop = asyncio.get_event_loop()
+            def _fetch():
+                with _urllib.urlopen(req, timeout=10) as r:
+                    return _json.loads(r.read())
+            return await loop.run_in_executor(None, _fetch)
+        except Exception as exc:
+            logger.warning("get_top_markets failed: %s", exc)
+            return []
+
     async def get_trades_by_market(
         self,
         condition_id: str,
