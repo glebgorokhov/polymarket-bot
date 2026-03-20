@@ -1,0 +1,256 @@
+"""
+CLOB API wrapper around py-clob-client.
+Provides async-compatible order placement, cancellation, and balance queries.
+Uses signature_type=1 (EIP-712) with relayer as funder.
+"""
+
+import asyncio
+import logging
+from functools import partial
+from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
+
+_RETRIES = 3
+_BACKOFF_BASE = 1.0
+
+
+async def _run_sync(func, *args, **kwargs) -> Any:
+    """Run a synchronous CLOB client call in the default thread pool."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, partial(func, *args, **kwargs))
+
+
+class ClobApiClient:
+    """
+    Async wrapper around the py-clob-client ClobClient.
+
+    All blocking SDK calls are dispatched to a thread pool executor
+    so the asyncio event loop is never blocked.
+    """
+
+    def __init__(
+        self,
+        relayer_api_key: str,
+        relayer_api_address: str,
+        signer_address: str,
+        host: str = "https://clob.polymarket.com",
+        chain_id: int = 137,
+    ) -> None:
+        """
+        Initialize the CLOB client wrapper.
+
+        Args:
+            relayer_api_key: API key for the relayer.
+            relayer_api_address: Wallet address used as the funder/relayer.
+            signer_address: Wallet that signs orders.
+            host: CLOB endpoint URL.
+            chain_id: EVM chain ID (137 = Polygon mainnet).
+        """
+        self._relayer_api_key = relayer_api_key
+        self._relayer_api_address = relayer_api_address
+        self._signer_address = signer_address
+        self._host = host
+        self._chain_id = chain_id
+        self._client = None
+
+    def _ensure_client(self):
+        """Lazily initialize the underlying CLOB client."""
+        if self._client is None:
+            try:
+                from py_clob_client.client import ClobClient
+                from py_clob_client.clob_types import ApiCreds
+
+                creds = ApiCreds(
+                    api_key=self._relayer_api_key,
+                    api_secret="",
+                    api_passphrase="",
+                )
+                self._client = ClobClient(
+                    host=self._host,
+                    chain_id=self._chain_id,
+                    key=self._signer_address,
+                    creds=creds,
+                    signature_type=1,
+                    funder=self._relayer_api_address,
+                )
+            except ImportError as exc:
+                raise RuntimeError(
+                    "py-clob-client is not installed. Add it to requirements.txt."
+                ) from exc
+        return self._client
+
+    async def _with_retry(self, func, *args, **kwargs) -> Any:
+        """Execute a sync CLOB operation in thread pool with retry logic."""
+        last_exc: Optional[Exception] = None
+        for attempt in range(_RETRIES):
+            try:
+                client = self._ensure_client()
+                return await _run_sync(func, client, *args, **kwargs)
+            except Exception as exc:
+                last_exc = exc
+                wait = _BACKOFF_BASE * (2 ** attempt)
+                logger.warning(
+                    "CLOB request failed (attempt %d/%d): %s. Retrying in %.1fs",
+                    attempt + 1,
+                    _RETRIES,
+                    exc,
+                    wait,
+                )
+                await asyncio.sleep(wait)
+        raise last_exc  # type: ignore[misc]
+
+    async def get_balance(self) -> float:
+        """
+        Return the available USDC balance for the relayer address.
+
+        Returns:
+            Balance in USD.
+        """
+        def _call(client) -> float:
+            # get_balance returns a string value in USDC units
+            result = client.get_balance()
+            if isinstance(result, dict):
+                return float(result.get("balance", 0))
+            return float(result or 0)
+
+        return await self._with_retry(_call)
+
+    async def get_midpoint(self, token_id: str) -> Optional[float]:
+        """
+        Get the current midpoint price for a market token.
+
+        Args:
+            token_id: CLOB token/outcome ID.
+
+        Returns:
+            Midpoint price as float or None if unavailable.
+        """
+        def _call(client) -> Optional[float]:
+            try:
+                result = client.get_midpoint(token_id=token_id)
+                if isinstance(result, dict):
+                    return float(result.get("mid", 0) or 0)
+                return float(result or 0)
+            except Exception:
+                return None
+
+        return await self._with_retry(_call)
+
+    async def get_spread(self, token_id: str) -> Optional[float]:
+        """
+        Get the current bid-ask spread for a market token.
+
+        Args:
+            token_id: CLOB token/outcome ID.
+
+        Returns:
+            Spread as a fraction (0.0–1.0) or None if unavailable.
+        """
+        def _call(client) -> Optional[float]:
+            try:
+                result = client.get_spread(token_id=token_id)
+                if isinstance(result, dict):
+                    return float(result.get("spread", 0) or 0)
+                return float(result or 0)
+            except Exception:
+                return None
+
+        return await self._with_retry(_call)
+
+    async def place_market_order(
+        self,
+        token_id: str,
+        side: str,
+        amount: float,
+    ) -> dict:
+        """
+        Place a market order for a token.
+
+        Args:
+            token_id: CLOB token ID.
+            side: "BUY" or "SELL".
+            amount: Amount in USD (BUY) or shares (SELL).
+
+        Returns:
+            Order response dict containing order_id and fill info.
+        """
+        def _call(client) -> dict:
+            from py_clob_client.clob_types import MarketOrderArgs, OrderType
+            from py_clob_client.order_builder.constants import BUY, SELL
+
+            clob_side = BUY if side.upper() == "BUY" else SELL
+            order_args = MarketOrderArgs(
+                token_id=token_id,
+                amount=amount,
+                side=clob_side,
+            )
+            signed_order = client.create_market_order(order_args)
+            return client.post_order(signed_order, OrderType.FOK)
+
+        return await self._with_retry(_call)
+
+    async def place_limit_order(
+        self,
+        token_id: str,
+        side: str,
+        price: float,
+        size: float,
+    ) -> dict:
+        """
+        Place a GTC limit order.
+
+        Args:
+            token_id: CLOB token ID.
+            side: "BUY" or "SELL".
+            price: Limit price (0–1).
+            size: Order size in shares.
+
+        Returns:
+            Order response dict.
+        """
+        def _call(client) -> dict:
+            from py_clob_client.clob_types import LimitOrderArgs, OrderType
+            from py_clob_client.order_builder.constants import BUY, SELL
+
+            clob_side = BUY if side.upper() == "BUY" else SELL
+            order_args = LimitOrderArgs(
+                token_id=token_id,
+                price=price,
+                size=size,
+                side=clob_side,
+            )
+            signed_order = client.create_limit_order(order_args)
+            return client.post_order(signed_order, OrderType.GTC)
+
+        return await self._with_retry(_call)
+
+    async def cancel_order(self, order_id: str) -> dict:
+        """
+        Cancel an open limit order.
+
+        Args:
+            order_id: The order ID to cancel.
+
+        Returns:
+            Cancellation response dict.
+        """
+        def _call(client) -> dict:
+            return client.cancel(order_id=order_id)
+
+        return await self._with_retry(_call)
+
+    async def get_open_orders(self) -> list[dict]:
+        """
+        Retrieve all open orders for the relayer account.
+
+        Returns:
+            List of open order dicts.
+        """
+        def _call(client) -> list:
+            result = client.get_orders()
+            if isinstance(result, list):
+                return result
+            return result.get("data", [])
+
+        return await self._with_retry(_call)
