@@ -590,7 +590,7 @@ async def cmd_feed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             result = []
             for t in trades:
                 slug = t.get("slug") or t.get("eventSlug") or t.get("marketSlug") or ""
-                        result.append({
+                result.append({
                     "trader_name": trader.display_name or trader.address[:12] + "…",
                     "trader_address": trader.address,
                     "trader_score": trader.score,
