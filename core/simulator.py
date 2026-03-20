@@ -39,7 +39,8 @@ WHALE_THRESHOLD = 0.05
 CONSENSUS_WINDOW_HOURS = 24
 RECENCY_DAYS = 60
 FIXED_TRADES_EXPECTED = 25
-MAX_BET_PCT = 0.20
+MAX_BET_PCT = 0.20       # never bet more than 20% of balance on one trade
+MIN_BET_PCT = 0.03       # always bet at least 3% of balance (floor for proportional)
 CONVICTION_MAX_BONUS = 0.5
 
 
@@ -326,17 +327,36 @@ def _build_positions(
 # ---------------------------------------------------------------------------
 
 def _size_proportional(pos: MarketPosition, balance: float) -> float:
+    """
+    Mirror trader's portfolio allocation, with a floor of MIN_BET_PCT.
+    Without a floor, bets are sub-cent for large-portfolio traders.
+    """
     if pos.implied_portfolio <= 0:
-        return balance * 0.05
-    pct = min(pos.total_cost / pos.implied_portfolio, MAX_BET_PCT)
+        pct = MIN_BET_PCT
+    else:
+        pct = pos.total_cost / pos.implied_portfolio
+    pct = max(pct, MIN_BET_PCT)   # floor: always bet at least 3%
+    pct = min(pct, MAX_BET_PCT)   # cap:   never bet more than 20%
     return pct * balance
 
 
 def _size_fixed(pos: MarketPosition, balance: float) -> float:
+    """
+    Fixed DOLLAR amount per bet — does NOT compound.
+    Always uses the same dollar value regardless of current balance.
+    Stored as a fraction of initial budget for consistency.
+    """
+    # NOTE: balance arg is initial budget here (sizer is always called
+    # with self.budget in run(), so this IS constant; compound mode
+    # handles fixed differently in _build_weekly_timeline).
     return balance / FIXED_TRADES_EXPECTED
 
 
 def _size_conviction(pos: MarketPosition, balance: float) -> float:
+    """
+    Proportional + bonus for cheap options (high potential return).
+    Low entry price → higher conviction bonus (up to +50%).
+    """
     base = _size_proportional(pos, balance)
     distance = abs(0.5 - pos.avg_price)
     bonus = (distance / 0.5) * CONVICTION_MAX_BONUS
@@ -407,7 +427,7 @@ def _build_weekly_timeline(
 
     sorted_bets = sorted(bets, key=lambda b: b.timestamp)
     if not sorted_bets[0].timestamp:
-        # No timestamps — just accumulate linearly
+        # No timestamps — accumulate linearly
         balance = budget
         total_pnl = sum(b.our_pnl for b in bets)
         return [
@@ -417,29 +437,38 @@ def _build_weekly_timeline(
 
     first_ts = sorted_bets[0].timestamp
     balance = budget
-    weekly_buckets: dict[int, tuple[float, int]] = {}  # week_num → (balance_after, bet_count)
+    is_bankrupt = False
+    BANKRUPT_THRESHOLD = 1.0  # below $1 = bankrupt, stop simulating
+    weekly_buckets: dict[int, tuple[float, int]] = {}
 
     for bet in sorted_bets:
+        if is_bankrupt:
+            break
+
         week_num = (bet.timestamp - first_ts) // (7 * 86400)
-        if compound:
-            sizer = _SIZERS.get(bet.sizing, _SIZERS["proportional"])
-            # Recalculate bet size with current balance
-            # We stored our_cost as fraction of original budget; scale to current balance
-            if budget > 0:
+
+        if compound and bet.sizing != "fixed":
+            # Compound mode: scale bet to current balance
+            # our_cost was sized against initial budget; derive the % and apply to balance
+            if budget > 0 and bet.our_cost > 0:
                 pct = bet.our_cost / budget
-                actual_bet = min(pct, MAX_BET_PCT) * balance
+                # Enforce floor/cap (proportional already has them, but re-enforce here)
+                pct = max(pct, MIN_BET_PCT)
+                pct = min(pct, MAX_BET_PCT)
+                actual_bet = pct * balance
             else:
                 actual_bet = bet.our_cost
-            # Scale pnl proportionally
-            if bet.our_cost > 0:
-                pnl = bet.our_pnl * (actual_bet / bet.our_cost)
-            else:
-                pnl = bet.our_pnl
+            # Return rate from trader's actual position
+            return_rate = bet.our_pnl / bet.our_cost if bet.our_cost > 0 else 0
+            pnl = return_rate * actual_bet
         else:
+            # Non-compound OR fixed sizing: use original calculated bet size
             pnl = bet.our_pnl
 
         balance += pnl
-        balance = max(balance, 0.01)  # can't go below $0.01
+        if balance < BANKRUPT_THRESHOLD:
+            balance = 0.0
+            is_bankrupt = True
 
         prev_balance, prev_count = weekly_buckets.get(week_num, (balance, 0))
         weekly_buckets[week_num] = (balance, prev_count + 1)
