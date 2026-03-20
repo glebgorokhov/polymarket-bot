@@ -137,15 +137,17 @@ class ClobApiClient:
 
     async def get_balance(self) -> float:
         """
-        Return the available USDC balance for the relayer address.
+        Return the available USDC (collateral) balance.
 
-        Returns:
-            Balance in USD.
+        Uses get_balance_allowance(asset_type=COLLATERAL) — the correct
+        py-clob-client method (there is no get_balance() on ClobClient).
         """
         def _call(client) -> float:
-            # get_balance returns a string value in USDC units
-            result = client.get_balance()
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            result = client.get_balance_allowance(params)
             if isinstance(result, dict):
+                # returns {"balance": "49.0", "allowance": "..."}
                 return float(result.get("balance", 0))
             return float(result or 0)
 
