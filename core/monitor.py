@@ -87,14 +87,17 @@ async def validate_signal(
         logger.warning("Spread check failed for token %s: %s", token_id, exc)
 
     # 4. Check price staleness (use trade timestamp)
-    ts_str = signal_data.get("timestamp", signal_data.get("createdAt", ""))
-    if ts_str:
+    ts_raw = signal_data.get("timestamp", signal_data.get("createdAt", ""))
+    if ts_raw:
         try:
-            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            if isinstance(ts_raw, (int, float)):
+                ts = datetime.fromtimestamp(float(ts_raw), tz=timezone.utc)
+            else:
+                ts = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00"))
             age_minutes = (datetime.now(timezone.utc) - ts).total_seconds() / 60
             if age_minutes > _PRICE_STALENESS_MIN:
                 return False, f"price_stale_{age_minutes:.1f}min"
-        except ValueError:
+        except (ValueError, OSError):
             pass
 
     # 5. Check no existing position in this market
