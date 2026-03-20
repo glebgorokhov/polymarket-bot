@@ -284,12 +284,33 @@ def _format_trader_card(trader) -> str:
 
     trades_per_week = f"{trader.avg_trades_per_week:.0f}/wk" if trader.avg_trades_per_week else "—"
 
-    return (
+    # Simulation row
+    sim_stats = extra.get("sim") or {}
+    if sim_stats.get("pnl") is not None:
+        pnl_val = float(sim_stats["pnl"])
+        pnl_pct = float(sim_stats.get("pnl_pct", 0))
+        sim_days = int(sim_stats.get("days", 0))
+        sim_mkts = int(sim_stats.get("total_markets", 0))
+        sim_won = int(sim_stats.get("won", 0))
+        sim_sign = "+" if pnl_val >= 0 else ""
+        sim_icon = "📈" if pnl_val >= 0 else "📉"
+        sim_str = (
+            f"{sim_icon} Sim $50→<b>${50 + pnl_val:.0f}</b> "
+            f"({sim_sign}{pnl_pct:.1f}%) in {sim_days}d "
+            f"[{sim_won}W/{sim_mkts - sim_won}L]"
+        )
+    else:
+        sim_str = None
+
+    card = (
         f"{status_icon} <b><a href=\"{profile_url}\">{name}</a></b>{rank_str}{pin_str}\n"
         f"💰 {pnl_str}  ·  Score: <b>{trader.score:.3f}</b>\n"
         f"📊 {trader.trade_count:,} positions · {trades_per_week} · {duration_str} active\n"
         f"⚡ {avg_bet_pct_str}  ·  last active {last_active}"
     )
+    if sim_str:
+        card += f"\n{sim_str}"
+    return card
 
 
 async def cmd_traders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -818,6 +839,93 @@ async def cmd_discover(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text(f"❌ Discovery failed: {exc}")
 
 
+async def cmd_simulate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handle /simulate. Runs backtest on all active/watching traders.
+    Simulates copying their trades proportionally from a $50 budget.
+    Saves results and displays a leaderboard of simulated PnL.
+    """
+    if not _is_admin(update):
+        return
+
+    cfg = get_settings()
+    budget = float(cfg.per_trade_budget or 50.0) if hasattr(cfg, "per_trade_budget") else 50.0
+
+    await update.message.reply_text(
+        "🔬 Running backtest simulation on all tracked traders...\n"
+        "Fetching their trade history + checking market resolutions. May take 1-2 minutes."
+    )
+
+    try:
+        from api.data_api import DataApiClient
+        from core.simulator import run_simulations
+        from db.repos.traders import TraderRepo
+
+        async with get_session() as session:
+            all_traders = list(await TraderRepo(session).get_all())
+
+        # Only simulate active + watching with known PnL
+        candidates = [
+            t for t in all_traders
+            if t.status in ("active", "watching") and (t.total_pnl or 0) > 0
+        ]
+
+        if not candidates:
+            await update.message.reply_text("No traders with known PnL yet. Run /discover first.")
+            return
+
+        async with DataApiClient() as data_client:
+            results = await run_simulations(candidates, data_client, budget=budget)
+
+        if not results:
+            await update.message.reply_text(
+                "❌ No simulation results — either no closed markets yet or market data unavailable."
+            )
+            return
+
+        # Save results back to category_strengths
+        async with get_session() as session:
+            repo = TraderRepo(session)
+            for trader in candidates:
+                res = results.get(trader.address)
+                if not res:
+                    continue
+                extra = dict(trader.category_strengths or {})
+                extra["sim"] = {
+                    "pnl": res.our_pnl,
+                    "pnl_pct": res.our_pnl_pct,
+                    "days": res.simulated_days,
+                    "total_markets": res.total_markets,
+                    "won": res.won_markets,
+                    "lost": res.lost_markets,
+                    "budget": budget,
+                }
+                await repo.update(trader.address, category_strengths=extra)
+
+        # Build leaderboard sorted by sim PnL
+        ranked = sorted(results.items(), key=lambda x: -x[1].our_pnl)
+
+        lines = [f"📊 <b>Backtest Results</b> — $50 starting budget\n"]
+        for i, (addr, res) in enumerate(ranked[:20], 1):
+            trader = next((t for t in candidates if t.address == addr), None)
+            name = (trader.display_name if trader else None) or addr[:12] + "…"
+            sign = "+" if res.our_pnl >= 0 else ""
+            icon = "📈" if res.our_pnl >= 0 else "📉"
+            final = 50.0 + res.our_pnl
+            lines.append(
+                f"{i}. {icon} <b>{name}</b>\n"
+                f"   ${50:.0f} → <b>${final:.2f}</b> ({sign}{res.our_pnl_pct:.1f}%) in {res.simulated_days}d\n"
+                f"   {res.won_markets}W / {res.lost_markets}L ({res.total_markets} closed mkts)"
+            )
+
+        lines.append("\n✅ Results saved — /traders now shows sim P&amp;L on each card.")
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    except Exception as exc:
+        logger.error("Simulation failed: %s", exc, exc_info=True)
+        await update.message.reply_text(f"❌ Simulation error: {exc}")
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Handle /help. Shows full command list.
@@ -840,6 +948,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/strategy list — All strategies + 7d P&L\n"
         "/strategy use &lt;slug&gt; — Switch strategy\n"
         "/signals — Last 20 signals across all tracked traders\n"
+        "/simulate — Backtest all traders with $50 — shows simulated P&amp;L\n"
+        "/discover — Force fresh trader discovery\n"
+        "/track &lt;address&gt; — Pin a trader (never auto-dropped)\n"
+        "/untrack &lt;address&gt; — Unpin a trader\n"
+        "/feed — Recent trades by top traders\n"
         "/report — Generate full report\n"
         "/settings — Show all settings\n"
         "/help — This message"

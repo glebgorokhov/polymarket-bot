@@ -143,6 +143,10 @@ class DataApiClient:
             return data
         return data.get("data", [])
 
+    async def get_all_user_trades(self, user: str) -> list[dict]:
+        """Alias for get_all_trades — used by simulator."""
+        return await self.get_all_trades(user)
+
     async def get_all_trades(self, user: str) -> list[dict]:
         """
         Fetch ALL trades for a user by paginating through the full history.
