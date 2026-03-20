@@ -128,6 +128,17 @@ class TraderRepo:
             await self._session.flush()
         return trader
 
+    async def update(self, address: str, **kwargs) -> Optional["Trader"]:
+        """Update arbitrary fields on a trader by address."""
+        trader = await self.get_by_address(address)
+        if trader is None:
+            return None
+        for key, value in kwargs.items():
+            if hasattr(trader, key):
+                setattr(trader, key, value)
+        await self._session.flush()
+        return trader
+
     async def update_status(self, trader_id: int, status: str) -> None:
         """Update the status field for a trader."""
         await self._session.execute(
