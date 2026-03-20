@@ -47,6 +47,10 @@ class SignalRepo:
         await self._session.flush()
         return signal
 
+    async def get_by_id(self, signal_id: int) -> Optional[Signal]:
+        """Fetch a signal by primary key."""
+        return await self._session.get(Signal, signal_id)
+
     async def update_action(
         self,
         signal_id: int,

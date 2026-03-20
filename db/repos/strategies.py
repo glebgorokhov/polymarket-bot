@@ -29,6 +29,13 @@ class StrategyRepo:
         )
         return result.scalar_one_or_none()
 
+    async def get_all_active(self) -> list[Strategy]:
+        """Return all strategies with is_active=True."""
+        result = await self._session.execute(
+            select(Strategy).where(Strategy.is_active == True).order_by(Strategy.id)
+        )
+        return list(result.scalars().all())
+
     async def get_by_slug(self, slug: str) -> Optional[Strategy]:
         """Fetch a strategy by its slug identifier."""
         result = await self._session.execute(

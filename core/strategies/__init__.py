@@ -43,3 +43,20 @@ def get_strategy(slug: str, params: dict | None = None) -> BaseStrategy:
     if cls is None:
         raise ValueError(f"Unknown strategy slug: {slug!r}")
     return cls(params=params or {})
+
+
+async def get_all_active_strategies() -> list[tuple]:
+    """Return all active strategies as (orm_model, strategy_instance) pairs."""
+    from db.repos.strategies import StrategyRepo
+    from db.session import get_session
+    async with get_session() as session:
+        repo = StrategyRepo(session)
+        active = await repo.get_all_active()
+    result = []
+    for strat_orm in active:
+        try:
+            instance = get_strategy(strat_orm.slug, strat_orm.params or {})
+            result.append((strat_orm, instance))
+        except ValueError:
+            pass
+    return result

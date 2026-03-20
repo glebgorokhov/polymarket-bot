@@ -29,6 +29,7 @@ class PositionRepo:
         strategy_id: Optional[int] = None,
         signal_id: Optional[int] = None,
         entry_cost: Optional[float] = None,
+        is_shadow: bool = False,
     ) -> Position:
         """Insert a new open position."""
         position = Position(
@@ -44,6 +45,7 @@ class PositionRepo:
             strategy_id=strategy_id,
             signal_id=signal_id,
             entry_cost=entry_cost,
+            is_shadow=is_shadow,
         )
         self._session.add(position)
         await self._session.flush()
@@ -53,10 +55,22 @@ class PositionRepo:
         """Fetch position by primary key."""
         return await self._session.get(Position, position_id)
 
-    async def get_open(self) -> Sequence[Position]:
-        """Return all currently open positions."""
+    async def get_open(self, is_shadow: bool | None = None) -> Sequence[Position]:
+        """Return open positions. Filter by is_shadow if provided."""
+        query = select(Position).where(Position.status == "open")
+        if is_shadow is not None:
+            query = query.where(Position.is_shadow == is_shadow)
+        result = await self._session.execute(query.order_by(Position.opened_at.desc()))
+        return result.scalars().all()
+
+    async def get_open_by_strategy(self, strategy_id: int, is_shadow: bool = False) -> Sequence[Position]:
+        """Return open positions for a specific strategy."""
         result = await self._session.execute(
-            select(Position).where(Position.status == "open").order_by(Position.opened_at.desc())
+            select(Position).where(
+                Position.status == "open",
+                Position.strategy_id == strategy_id,
+                Position.is_shadow == is_shadow,
+            ).order_by(Position.opened_at.desc())
         )
         return result.scalars().all()
 
@@ -70,13 +84,13 @@ class PositionRepo:
         )
         return result.scalars().all()
 
-    async def get_closed(self, limit: int = 10) -> Sequence[Position]:
-        """Return recently closed positions."""
+    async def get_closed(self, limit: int = 10, is_shadow: bool | None = None) -> Sequence[Position]:
+        """Return recently closed positions. Filter by is_shadow if provided."""
+        query = select(Position).where(Position.status == "closed")
+        if is_shadow is not None:
+            query = query.where(Position.is_shadow == is_shadow)
         result = await self._session.execute(
-            select(Position)
-            .where(Position.status == "closed")
-            .order_by(Position.closed_at.desc())
-            .limit(limit)
+            query.order_by(Position.closed_at.desc()).limit(limit)
         )
         return result.scalars().all()
 

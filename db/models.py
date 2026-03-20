@@ -125,6 +125,7 @@ class Position(Base):
     size_usd: Mapped[float] = mapped_column(Float, nullable=False)
     shares: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     status: Mapped[str] = mapped_column(String(16), default="open", nullable=False, index=True)  # open / closed
+    is_shadow: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     strategy_id: Mapped[Optional[int]] = mapped_column(
         BigInteger, ForeignKey("strategies.id", ondelete="SET NULL"), nullable=True
     )

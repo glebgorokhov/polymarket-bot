@@ -35,7 +35,7 @@ _DEFAULT_STRATEGIES = [
         "name": "Pure Follow",
         "description": "Copy every trade proportionally. Exit when trader exits.",
         "params": {},
-        "is_active": False,
+        "is_active": True,
     },
     {
         "slug": "consensus",
@@ -49,21 +49,21 @@ _DEFAULT_STRATEGIES = [
         "name": "Whale Entry",
         "description": "Only copy when trader's bet exceeds 2x their average size.",
         "params": {"size_multiplier": 2.0},
-        "is_active": False,
+        "is_active": True,
     },
     {
         "slug": "category_expert",
         "name": "Category Expert",
         "description": "Copy traders only within their strongest category.",
         "params": {"min_strength": 0.6},
-        "is_active": False,
+        "is_active": True,
     },
     {
         "slug": "smart_exit",
         "name": "Smart Exit",
         "description": "Trail the position instead of blindly exiting with trader.",
         "params": {"trail_stop_pct": 25, "take_profit_prob": 0.85},
-        "is_active": False,
+        "is_active": True,
     },
 ]
 

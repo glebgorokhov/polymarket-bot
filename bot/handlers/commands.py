@@ -91,22 +91,24 @@ async def _build_status_text() -> str:
         mode = await settings_repo.get("mode", "manual")
         active_slug = await settings_repo.get("active_strategy_slug", "consensus")
         position_repo = PositionRepo(session)
-        open_positions = list(await position_repo.get_open())
-        deployed = sum(p.size_usd for p in open_positions)
+        real_positions = list(await position_repo.get_open(is_shadow=False))
+        shadow_positions = list(await position_repo.get_open(is_shadow=True))
+        deployed = sum(p.size_usd for p in real_positions)
 
-        # Today's P&L
+        # Today's P&L (real positions only)
         today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
         closed_today = list(await position_repo.get_closed_in_period(today_start, datetime.now(timezone.utc)))
-        today_pnl = sum(p.pnl or 0 for p in closed_today)
+        today_pnl = sum(p.pnl or 0 for p in closed_today if not p.is_shadow)
 
+    shadow_note = f" (+{len(shadow_positions)} shadow)" if shadow_positions else ""
     return (
         f"📊 <b>Status</b>\n\n"
         f"💰 Balance: ${balance:.2f}\n"
         f"📦 Deployed: ${deployed:.2f}\n"
         f"📈 Today P&L: {'+' if today_pnl >= 0 else ''}${today_pnl:.2f}\n"
         f"🔄 Mode: <b>{mode.upper()}</b>\n"
-        f"🎯 Strategy: <b>{active_slug}</b>\n"
-        f"📂 Open positions: <b>{len(open_positions)}</b>"
+        f"🎯 Primary strategy: <b>{active_slug}</b>\n"
+        f"📂 Open positions: <b>{len(real_positions)}</b>{shadow_note}"
     )
 
 
@@ -283,16 +285,17 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def _build_positions_text() -> str:
-    """Build positions summary string."""
+    """Build positions summary string (real positions only, shadow count shown separately)."""
     async with get_session() as session:
         position_repo = PositionRepo(session)
-        open_positions = list(await position_repo.get_open())
+        real_positions = list(await position_repo.get_open(is_shadow=False))
+        shadow_positions = list(await position_repo.get_open(is_shadow=True))
 
-    if not open_positions:
+    if not real_positions and not shadow_positions:
         return "📂 No open positions."
 
-    lines = [f"📂 <b>Open Positions ({len(open_positions)})</b>\n"]
-    for pos in open_positions:
+    lines = [f"📂 <b>Open Positions ({len(real_positions)} real)</b>\n"]
+    for pos in real_positions:
         current = pos.current_price or pos.entry_price
         entry_cost = pos.entry_cost or pos.size_usd
         current_value = (pos.shares or 0) * current
@@ -305,6 +308,8 @@ async def _build_positions_text() -> str:
             f"{icon} <b>{market_short}</b>\n"
             f"   {pos.side} @ {pos.entry_price:.4f} | Now: ${current_value:.2f} ({sign}{pnl_pct:.1f}%)"
         )
+    if shadow_positions:
+        lines.append(f"\n👁️ <i>{len(shadow_positions)} shadow simulation position(s) running in background</i>")
     return "\n".join(lines)
 
 
@@ -324,7 +329,7 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     async with get_session() as session:
         position_repo = PositionRepo(session)
-        closed = list(await position_repo.get_closed(limit=n))
+        closed = list(await position_repo.get_closed(limit=n, is_shadow=False))
 
     if not closed:
         await update.message.reply_text("No closed positions found.")
@@ -367,18 +372,25 @@ async def cmd_strategy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def _cmd_strategy_list(update: Update) -> None:
-    """List all strategies with 7d performance."""
+    """List all strategies with 7d performance, marking primary and shadow roles."""
     async with get_session() as session:
         strategy_repo = StrategyRepo(session)
+        settings_repo = SettingsRepo(session)
         strategies = list(await strategy_repo.get_all())
-        lines = ["🎯 <b>Strategies</b>\n"]
+        primary_slug = await settings_repo.get("active_strategy_slug", "consensus")
+        lines = ["🎯 <b>Strategies</b> (🎯 = primary for real trades, 👁️ = shadow simulation)\n"]
         for strat in strategies:
             letter = STRATEGY_LETTERS.get(strat.slug, "?")
             pnl_7d = await strategy_repo.get_7d_pnl(strat.id)
             sign = "+" if pnl_7d >= 0 else ""
-            active_tag = " ✅ [active]" if strat.is_active else ""
+            if strat.slug == primary_slug and strat.is_active:
+                role_tag = " 🎯 [primary]"
+            elif strat.is_active:
+                role_tag = " 👁️ [shadow]"
+            else:
+                role_tag = " ⭕ [disabled]"
             lines.append(
-                f"<b>{letter}. {strat.name}</b>{active_tag}\n"
+                f"<b>{letter}. {strat.name}</b>{role_tag}\n"
                 f"   Slug: <code>{strat.slug}</code> | 7d P&L: {sign}${pnl_7d:.2f}\n"
                 f"   {strat.description}"
             )
@@ -387,17 +399,22 @@ async def _cmd_strategy_list(update: Update) -> None:
 
 
 async def _cmd_strategy_use(update: Update, slug: str) -> None:
-    """Switch active strategy."""
+    """Set the primary strategy (the one that places real/paper trades)."""
     async with get_session() as session:
         strategy_repo = StrategyRepo(session)
         settings_repo = SettingsRepo(session)
-        found = await strategy_repo.set_active(slug)
+        found = await strategy_repo.get_by_slug(slug)
         if not found:
             await update.message.reply_text(f"❌ Strategy '{slug}' not found.")
             return
         await settings_repo.set("active_strategy_slug", slug)
 
-    await update.message.reply_text(f"✅ Strategy switched to <b>{slug}</b>", parse_mode="HTML")
+    await update.message.reply_text(
+        f"✅ Primary strategy set to <b>{slug}</b>\n"
+        f"🎯 Real/paper trades will use this strategy.\n"
+        f"👁️ All other active strategies continue as shadow simulations.",
+        parse_mode="HTML",
+    )
 
 
 async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
