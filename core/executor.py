@@ -201,7 +201,11 @@ async def execute_copy_trade(signal: Signal, mode: str) -> None:
                 logger.error("Order placement failed: %s", exc)
                 from bot.notifications import error_alert, send_notification
                 await send_notification(error_alert(str(exc)))
-                is_primary = False  # save as shadow on failure
+                # Mark signal as error and skip — do NOT create a shadow position
+                # for a failed real order (avoids phantom stop-loss notifications)
+                async with get_session() as session:
+                    await SignalRepo(session).update_action(signal.id, "error", f"order_failed:{exc}")
+                continue
 
         is_shadow = not is_primary
         async with get_session() as session:
@@ -287,7 +291,8 @@ async def close_position(position: Position, reason: str) -> None:
 
     logger.info("Position %d closed: reason=%s exit_value=%.2f", position.id, reason, exit_value)
 
-    if updated_position:
+    # Only notify for real positions — shadow positions are simulation-only
+    if updated_position and not position.is_shadow:
         from bot.notifications import trade_closed, send_notification
         await send_notification(trade_closed(updated_position))
 
@@ -306,6 +311,9 @@ async def check_stop_losses() -> None:
     clob_client = _get_clob_client()
 
     for position in open_positions:
+        # Never send stop-loss alerts for shadow positions — they have no real money
+        if position.is_shadow:
+            continue
         try:
             current_price = await clob_client.get_midpoint(token_id=position.token_id)
             if current_price is None:
