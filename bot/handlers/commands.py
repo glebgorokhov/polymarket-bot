@@ -80,9 +80,11 @@ async def _build_status_text() -> str:
     try:
         from api.clob import ClobApiClient
         clob = ClobApiClient(
+            private_key=cfg.private_key,
             relayer_api_key=cfg.relayer_api_key,
             relayer_api_address=cfg.relayer_api_address,
             signer_address=cfg.signer_address,
+            funder_address=cfg.funder_address,
         )
         raw_balance = await clob.get_balance()
         balance = float(raw_balance or 0)
