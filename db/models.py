@@ -87,6 +87,24 @@ class TraderSnapshot(Base):
     trader: Mapped["Trader"] = relationship("Trader", back_populates="snapshots")
 
 
+class TraderPnlSnapshot(Base):
+    """
+    Weekly leaderboard PnL snapshots per trader.
+    This is the only way to build a real equity curve — collect one snapshot
+    per discovery run and compute curve consistency over time.
+    """
+
+    __tablename__ = "trader_pnl_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trader_address: Mapped[str] = mapped_column(String(42), nullable=False, index=True)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    leaderboard_pnl: Mapped[float] = mapped_column(Float, nullable=False)
+    leaderboard_volume: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    leaderboard_rank: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    open_position_value: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+
 class Signal(Base):
     """Detected trade signals from watched traders."""
 

@@ -173,6 +173,43 @@ class DataApiClient:
             await asyncio.sleep(0.05)  # Be respectful
         return all_trades
 
+    async def get_trades_by_market(
+        self,
+        condition_id: str,
+        limit: int = 500,
+        offset: int = 0,
+    ) -> list[dict]:
+        """Fetch trades for a specific market (conditionId)."""
+        data = await _get(
+            self._ensure_client(),
+            "/trades",
+            params={"conditionId": condition_id, "limit": limit, "offset": offset},
+        )
+        if isinstance(data, list):
+            return data
+        return data.get("data", [])
+
+    async def get_all_traders_in_market(self, condition_id: str) -> set[str]:
+        """
+        Get all unique trader addresses that participated in a market.
+        Market-level endpoint has no offset cap (unlike user-level which caps at 3000).
+        """
+        traders: set[str] = set()
+        offset = 0
+        while True:
+            batch = await self.get_trades_by_market(condition_id, limit=500, offset=offset)
+            if not batch:
+                break
+            for t in batch:
+                addr = (t.get("proxyWallet") or t.get("maker") or "").lower()
+                if addr:
+                    traders.add(addr)
+            if len(batch) < 500:
+                break
+            offset += 500
+            await asyncio.sleep(0.05)
+        return traders
+
     async def get_positions(self, user: str) -> list[dict]:
         """
         Fetch open positions for a user address.
@@ -210,6 +247,24 @@ class DataApiClient:
         if isinstance(data, dict):
             return data
         return {}
+
+    async def get_top_markets(self, limit: int = 50) -> list[dict]:
+        """
+        Fetch top active markets by volume from Gamma API.
+        Returns list of market dicts with conditionId, question, volumeNum.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(
+                    "https://gamma-api.polymarket.com/markets",
+                    params={"closed": "false", "limit": limit, "order": "volumeNum", "ascending": "false"},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                return data if isinstance(data, list) else []
+        except Exception as exc:
+            logger.warning("Failed to fetch top markets: %s", exc)
+            return []
 
     async def get_activity(self, user: str, limit: int = 20) -> list[dict]:
         """

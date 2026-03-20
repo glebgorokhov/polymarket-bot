@@ -153,6 +153,85 @@ class TraderRepo:
         return len(result.scalars().all())
 
 
+class TraderPnlSnapshotRepo:
+    """
+    Stores weekly leaderboard PnL snapshots per trader.
+    Used to build equity curves over time for curve consistency scoring.
+    """
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def add(
+        self,
+        address: str,
+        leaderboard_pnl: float,
+        leaderboard_volume: Optional[float] = None,
+        leaderboard_rank: Optional[int] = None,
+        open_position_value: Optional[float] = None,
+    ) -> None:
+        from db.models import TraderPnlSnapshot
+        from datetime import timezone
+        snap = TraderPnlSnapshot(
+            trader_address=address.lower(),
+            captured_at=datetime.now(timezone.utc),
+            leaderboard_pnl=leaderboard_pnl,
+            leaderboard_volume=leaderboard_volume,
+            leaderboard_rank=leaderboard_rank,
+            open_position_value=open_position_value,
+        )
+        self._session.add(snap)
+
+    async def get_history(self, address: str, limit: int = 52) -> list:
+        """
+        Return PnL snapshots for a trader, oldest first, up to `limit` weeks.
+        """
+        from db.models import TraderPnlSnapshot
+        result = await self._session.execute(
+            select(TraderPnlSnapshot)
+            .where(TraderPnlSnapshot.trader_address == address.lower())
+            .order_by(TraderPnlSnapshot.captured_at.asc())
+            .limit(limit)
+        )
+        return list(result.scalars().all())
+
+    async def compute_curve_consistency(self, address: str) -> Optional[float]:
+        """
+        Compute R² + drawdown score from stored PnL snapshots.
+        Returns None if fewer than 3 snapshots (not enough data).
+        """
+        import math
+        snaps = await self.get_history(address, limit=52)
+        if len(snaps) < 3:
+            return None
+
+        values = [s.leaderboard_pnl for s in snaps]
+        n = len(values)
+        x = list(range(n))
+        x_mean = sum(x) / n
+        y_mean = sum(values) / n
+        ss_xy = sum((xi - x_mean) * (yi - y_mean) for xi, yi in zip(x, values))
+        ss_xx = sum((xi - x_mean) ** 2 for xi in x)
+        ss_yy = sum((yi - y_mean) ** 2 for yi in values)
+        r2 = (ss_xy ** 2) / (ss_xx * ss_yy) if (ss_xx * ss_yy) > 0 else 0
+
+        # Max drawdown as % of final PnL
+        peak = values[0]
+        max_dd = 0
+        for v in values:
+            if v > peak:
+                peak = v
+            dd = peak - v
+            if dd > max_dd:
+                max_dd = dd
+
+        final_pnl = max(abs(values[-1]), 1)
+        dd_score = max(0.0, 1.0 - (max_dd / final_pnl))
+
+        # Combined: R² weighted more
+        return round(r2 * 0.6 + dd_score * 0.4, 4)
+
+
 class TraderSnapshotRepo:
     """Data access layer for the trader_snapshots table."""
 

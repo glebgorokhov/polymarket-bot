@@ -24,7 +24,7 @@ from typing import Optional
 
 from api.data_api import DataApiClient
 from db.models import Trader
-from db.repos.traders import TraderRepo, TraderSnapshotRepo
+from db.repos.traders import TraderPnlSnapshotRepo, TraderRepo, TraderSnapshotRepo
 from db.session import get_session
 
 logger = logging.getLogger(__name__)
@@ -58,6 +58,7 @@ def compute_composite_score(
     last_active_days_ago: int,
     position_count: int,
     avg_position_size: float,
+    curve_consistency: Optional[float] = None,
 ) -> float:
     """
     Ground-truth composite score. Uses leaderboard data as the primary signal.
@@ -90,12 +91,25 @@ def compute_composite_score(
     # Component 4: Recency — full score within 7 days, drops to 0 at 21 days
     recency_score = max(0.0, 1.0 - (last_active_days_ago / _MAX_INACTIVE_DAYS))
 
-    score = (
-        pnl_score * 0.40
-        + efficiency_score * 0.30
-        + duration_score * 0.20
-        + recency_score * 0.10
-    )
+    if curve_consistency is not None:
+        # We have snapshot-based curve data — incorporate it
+        # Curve consistency replaces some of the duration/recency weight
+        # because it directly measures what we care about (smooth growth)
+        score = (
+            pnl_score * 0.35
+            + efficiency_score * 0.25
+            + curve_consistency * 0.25  # direct curve quality measurement
+            + duration_score * 0.10
+            + recency_score * 0.05
+        )
+    else:
+        # No snapshot data yet — use proxy metrics only
+        score = (
+            pnl_score * 0.40
+            + efficiency_score * 0.30
+            + duration_score * 0.20
+            + recency_score * 0.10
+        )
 
     return round(min(score, 1.0), 4)
 
@@ -129,37 +143,79 @@ def _compute_position_win_rate(positions: list[dict]) -> float:
 
 async def _fetch_all_leaderboard_candidates() -> dict[str, dict]:
     """
-    Pull top traders from all leaderboard categories.
-    Returns dict of address → leaderboard entry (deduped, best PnL wins).
+    Pull trader candidates from two sources:
+
+    1. Leaderboard (top ~200 per category × 9 categories = ~500 unique)
+       These are the richest traders by PnL — well-known, proven.
+
+    2. Top-50 markets by volume (market-level participant discovery)
+       Each high-volume market has hundreds to thousands of traders.
+       Many are NOT on the global leaderboard but trade specific domains well.
+       This is how we find small, consistent traders with perfect curve consistency.
+
+    Returns dict of address → leaderboard entry dict (with pnl, vol, rank fields).
+    For market-discovered traders without a leaderboard entry, pnl/vol default to 0
+    and get filled in during _score_candidate via actual positions + leaderboard lookup.
     """
     candidates: dict[str, dict] = {}
 
+    # Source 1: Leaderboard
     async with DataApiClient() as client:
         for category in _CATEGORIES:
-            for time_period in _TIME_PERIODS:
-                try:
-                    entries = await client.get_leaderboard(
-                        category=category,
-                        order_by="PNL",
-                        limit=200,
-                    )
-                    for entry in entries:
-                        address = (entry.get("proxyWallet") or entry.get("address") or "").lower()
-                        if not address:
-                            continue
-                        existing_pnl = candidates.get(address, {}).get("pnl", 0)
-                        entry_pnl = float(entry.get("pnl", 0) or 0)
-                        if address not in candidates or entry_pnl > existing_pnl:
-                            candidates[address] = entry
-                    await asyncio.sleep(0.2)
-                except Exception as exc:
-                    logger.warning(
-                        "Leaderboard fetch failed (category=%s, period=%s): %s",
-                        category, time_period, exc,
-                    )
-                    continue
+            try:
+                entries = await client.get_leaderboard(
+                    category=category,
+                    order_by="PNL",
+                    limit=200,
+                )
+                for entry in entries:
+                    address = (entry.get("proxyWallet") or entry.get("address") or "").lower()
+                    if not address:
+                        continue
+                    existing_pnl = float(candidates.get(address, {}).get("pnl", 0))
+                    entry_pnl = float(entry.get("pnl", 0) or 0)
+                    if address not in candidates or entry_pnl > existing_pnl:
+                        candidates[address] = entry
+                await asyncio.sleep(0.2)
+            except Exception as exc:
+                logger.warning("Leaderboard fetch failed (category=%s): %s", category, exc)
 
-    logger.info("Fetched %d unique candidates from leaderboard", len(candidates))
+    logger.info("Leaderboard: %d unique candidates", len(candidates))
+
+    # Source 2: Top markets by volume
+    # Fetch trader addresses from each market's trade history
+    # Market-level trades have NO offset cap (unlike user-level 3000 cap)
+    try:
+        async with DataApiClient() as client:
+            markets = await client.get_top_markets(limit=50)
+
+        market_trader_count = 0
+        sem = asyncio.Semaphore(3)
+
+        async def collect_market_traders(market: dict) -> None:
+            nonlocal market_trader_count
+            cid = market.get("conditionId", "")
+            if not cid:
+                return
+            async with sem:
+                try:
+                    async with DataApiClient() as client:
+                        traders = await client.get_all_traders_in_market(cid)
+                    for addr in traders:
+                        if addr not in candidates:
+                            candidates[addr] = {"pnl": 0, "vol": 0, "rank": 9999, "proxyWallet": addr}
+                            market_trader_count += 1
+                    await asyncio.sleep(0.3)
+                except Exception as exc:
+                    logger.debug("Market %s trader fetch failed: %s", cid[:16], exc)
+
+        await asyncio.gather(*[collect_market_traders(m) for m in markets[:50]])
+        logger.info("Markets: added %d new traders not on leaderboard", market_trader_count)
+
+    except Exception as exc:
+        logger.warning("Market-level discovery failed: %s", exc)
+
+    logger.info("Total candidates: %d (leaderboard + market-level)", len(candidates))
     return candidates
 
 
@@ -253,6 +309,15 @@ async def _score_candidate(address: str, entry: dict) -> Optional[tuple[float, d
         implied_portfolio = leaderboard_pnl + open_value  # rough estimate
         avg_bet_pct = avg_position_size / max(implied_portfolio, 1)
 
+        # Look up stored curve consistency (from previous discovery snapshots)
+        curve_consistency: Optional[float] = None
+        try:
+            async with get_session() as snap_session:
+                snap_repo = TraderPnlSnapshotRepo(snap_session)
+                curve_consistency = await snap_repo.compute_curve_consistency(address)
+        except Exception:
+            pass
+
         # Compute score
         score = compute_composite_score(
             leaderboard_pnl=leaderboard_pnl,
@@ -261,6 +326,7 @@ async def _score_candidate(address: str, entry: dict) -> Optional[tuple[float, d
             last_active_days_ago=last_active_days_ago,
             position_count=len(positions),
             avg_position_size=avg_position_size,
+            curve_consistency=curve_consistency,
         )
 
         if score < _SCORE_THRESHOLD:
@@ -349,6 +415,7 @@ async def discover_top_traders() -> None:
 
     async with get_session() as session:
         trader_repo = TraderRepo(session)
+        snapshot_repo = TraderPnlSnapshotRepo(session)
 
         # Load all existing traders (including pinned)
         existing_traders: dict[str, Trader] = {
@@ -359,6 +426,14 @@ async def discover_top_traders() -> None:
         for _score, data in top_watching:
             address = data["address"]
             new_addresses.add(address)
+            # Store PnL snapshot for curve consistency tracking
+            await snapshot_repo.add(
+                address=address,
+                leaderboard_pnl=data.get("total_pnl", 0),
+                leaderboard_volume=None,
+                leaderboard_rank=data.get("leaderboard_rank"),
+                open_position_value=data.get("category_strengths", {}).get("open_position_value"),
+            )
 
             # Determine status
             rank_in_scored = next(
