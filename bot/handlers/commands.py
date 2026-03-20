@@ -890,8 +890,9 @@ async def cmd_simulate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     budget = float(cfg.per_trade_budget or 50.0) if hasattr(cfg, "per_trade_budget") else 50.0
 
     await update.message.reply_text(
-        "🔬 Running backtest simulation on all tracked traders...\n"
-        "Fetching their trade history + checking market resolutions. May take 1-2 minutes."
+        f"🔬 Running backtest on top {limit} traders by score...\n"
+        f"Fetching trade history + checking market resolutions. May take a few minutes.\n"
+        f"Tip: /simulate 10 for a quicker run on top 10 only."
     )
 
     try:
@@ -902,11 +903,15 @@ async def cmd_simulate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         async with get_session() as session:
             all_traders = list(await TraderRepo(session).get_all())
 
-        # Only simulate active + watching with known PnL
-        candidates = [
-            t for t in all_traders
-            if t.status in ("active", "watching") and (t.total_pnl or 0) > 0
-        ]
+        # Parse optional limit arg: /simulate 20 → top 20 by score
+        args = context.args or []
+        limit = int(args[0]) if args and args[0].isdigit() else 50
+
+        # Only simulate active + watching with known PnL, top N by score
+        candidates = sorted(
+            [t for t in all_traders if t.status in ("active", "watching") and (t.total_pnl or 0) > 0],
+            key=lambda t: -(t.score or 0),
+        )[:limit]
 
         if not candidates:
             await update.message.reply_text("No traders with known PnL yet. Run /discover first.")
