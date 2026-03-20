@@ -88,12 +88,16 @@ class ClobApiClient:
                         api_passphrase=self._relayer_api_passphrase,
                     )
 
+                # signature_type=0 (ECDSA) = standard MetaMask/EOA wallet
+                # signature_type=1 (POLY_PROXY) = Magic Link / Google login (exported PK)
+                # signature_type=2 (GNOSIS_SAFE) = Gnosis Safe contract wallet
+                # 0xc570... is confirmed EOA (no bytecode) → sig_type=0
                 self._client = ClobClient(
                     host=self._host,
                     chain_id=self._chain_id,
                     key=self._private_key,
                     creds=creds,
-                    signature_type=2,  # GNOSIS_SAFE — standard for MetaMask users
+                    signature_type=0,  # ECDSA — EOA (MetaMask)
                     funder=self._funder_address or self._relayer_api_address,
                 )
 
