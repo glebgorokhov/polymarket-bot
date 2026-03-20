@@ -56,10 +56,10 @@ async def validate_signal(
         (is_valid: bool, reason: str if invalid)
     """
     market_id = signal_data.get("market", {}).get("conditionId", "") if isinstance(signal_data.get("market"), dict) else signal_data.get("conditionId", "")
-    token_id = signal_data.get("asset_id", signal_data.get("tokenId", ""))
+    token_id = signal_data.get("asset_id") or signal_data.get("asset") or signal_data.get("tokenId") or ""
 
-    if not market_id or not token_id:
-        return False, "missing_market_or_token"
+    if not market_id:
+        return False, "missing_market_id"
 
     # 1. Check market active + end date via Gamma
     try:
@@ -240,23 +240,53 @@ async def _process_trade(
         settings_cfg: Pydantic Settings instance.
     """
     # Extract key fields
+    # Data API returns flat fields: conditionId, title, outcome, outcomeIndex, asset, price, size
+    # NOT nested market object or asset_id/tokenId.
     market_info = trade.get("market", {})
-    if isinstance(market_info, dict):
+    if isinstance(market_info, dict) and market_info:
         market_id = market_info.get("conditionId", "")
         market_name = market_info.get("question", "Unknown Market")
         market_category = market_info.get("category", "UNKNOWN")
     else:
         market_id = trade.get("conditionId", "")
-        market_name = "Unknown Market"
+        market_name = trade.get("title", "Unknown Market")
         market_category = "UNKNOWN"
 
-    token_id = trade.get("asset_id", trade.get("tokenId", ""))
+    # token_id: Data API doesn't return it — look up from CLOB via conditionId + outcomeIndex
+    token_id = trade.get("asset_id") or trade.get("asset") or trade.get("tokenId") or ""
+    outcome_index = int(trade.get("outcomeIndex", 0) or 0)
+
+    if not token_id and market_id:
+        # Fetch token_id from CLOB market endpoint
+        try:
+            import httpx as _httpx
+            _resp = await asyncio.to_thread(
+                lambda: _httpx.get(
+                    f"https://clob.polymarket.com/markets/{market_id}",
+                    timeout=10,
+                ).json()
+            )
+            tokens = _resp.get("tokens", [])
+            if tokens and outcome_index < len(tokens):
+                token_id = tokens[outcome_index].get("token_id", "")
+                if not market_name or market_name == "Unknown Market":
+                    market_name = _resp.get("question", market_name)
+            logger.debug("Resolved token_id from CLOB for %s[%d]: %s", market_id[:16], outcome_index, token_id[:20] if token_id else "NONE")
+        except Exception as exc:
+            logger.warning("Failed to resolve token_id from CLOB: %s", exc)
+
     side = "BUY" if trade.get("side", "").upper() in ("BUY", "LONG") else "SELL"
     price = float(trade.get("price", trade.get("avgPrice", 0)) or 0)
-    size_usd = float(trade.get("value", trade.get("size", trade.get("amount", 0))) or 0)
+    size_raw = trade.get("value") or trade.get("size") or trade.get("amount") or 0
+    size_usd = float(size_raw) * price if float(size_raw) > 0 else 0
     trade_id = str(trade.get("id", trade.get("transactionHash", "")))
 
-    if not market_id or not token_id or price <= 0:
+    if not market_id or price <= 0:
+        logger.debug("Skipping trade: no market_id or price<=0")
+        return
+
+    if not token_id:
+        logger.warning("Skipping trade: could not resolve token_id for %s", market_id[:20])
         return
 
     is_valid, skip_reason = await validate_signal(
