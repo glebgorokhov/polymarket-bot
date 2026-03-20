@@ -23,15 +23,15 @@ from db.session import get_session
 
 logger = logging.getLogger(__name__)
 
-_ACTIVE_SCORE_THRESHOLD = 0.30  # Score needed to be actively monitored (polled every 30s)
+_ACTIVE_SCORE_THRESHOLD = 0.55  # Score needed to be actively monitored (polled every 30s)
 _WATCHING_N = 500               # Max stored in DB for scoring/reference
-_SCORE_THRESHOLD = 0.25         # Minimum score to stay in DB at all
+_SCORE_THRESHOLD = 0.30         # Minimum score to stay in DB at all
 _MIN_TRADES = 30                # Require at least 30 total trades
 _MIN_MONTHS_ACTIVE = 3          # Require at least 3 months of history
-# No hard cap on active traders — everyone above _ACTIVE_SCORE_THRESHOLD gets polled.
-# VIP bypass: top leaderboard traders with high PnL+volume skip consistency gates.
-_VIP_MIN_PNL = 10_000.0         # Leaderboard PnL (USD) threshold for VIP bypass
-_VIP_MIN_VOLUME = 100_000.0     # Leaderboard volume (USD) threshold for VIP bypass
+_MAX_INACTIVE_DAYS = 60         # Hard gate: traders not active in 60d are excluded entirely
+# VIP bypass: top leaderboard traders skip the monthly consistency gate if still active.
+_VIP_MIN_PNL = 10_000.0
+_VIP_MIN_VOLUME = 100_000.0
 
 # All Polymarket categories to pull from
 _CATEGORIES = [
@@ -102,8 +102,16 @@ def _compute_frequency_score(trades_per_month: float) -> float:
     return min(trades_per_month / 10.0, 1.0)
 
 
-def _compute_recency_score(last_active_at: Optional[datetime]) -> float:
-    """Penalize dormant traders. 1.0 if active within 14d, 0.5 within 30d, else 0."""
+def _compute_recency_multiplier(last_active_at: Optional[datetime]) -> float:
+    """
+    Recency as a MULTIPLIER (0–1), applied to the entire score.
+    A dormant trader is worthless to copy regardless of historical stats.
+
+    - ≤14 days → 1.0 (full score)
+    - ≤30 days → 0.7
+    - ≤60 days → 0.3
+    - >60 days  → 0.0 (hard killed)
+    """
     if last_active_at is None:
         return 0.0
     now = datetime.now(timezone.utc)
@@ -113,8 +121,10 @@ def _compute_recency_score(last_active_at: Optional[datetime]) -> float:
     if days_ago <= 14:
         return 1.0
     if days_ago <= 30:
-        return 0.5
-    return 0.0
+        return 0.7
+    if days_ago <= 60:
+        return 0.3
+    return 0.0  # >60 days inactive = never copy
 
 
 def _compute_winning_streak_bonus(monthly_pnl_history: list[dict]) -> float:
@@ -142,13 +152,14 @@ def compute_composite_score(
     Composite trader quality score, heavily weighted toward consistency.
 
     Formula:
-        score = (consistency * 0.50)   ← dominant factor
-              + (sharpe * 0.20)
-              + (diversity * 0.15)
-              + (recency * 0.10)
-              + (frequency * 0.05)
-              + streak_bonus (up to 0.20)
+        base = (consistency * 0.60)   ← dominant factor
+             + (sharpe * 0.25)
+             + (diversity * 0.15)
+             + streak_bonus (up to 0.20)
+        score = base × recency_multiplier   ← recency kills inactive traders
         capped at 1.0
+
+    Recency is a MULTIPLIER, not additive. A trader inactive >60 days scores 0.
 
     Args:
         monthly_pnl_history: List of {month: "YYYY-MM", pnl: float} dicts.
@@ -158,11 +169,16 @@ def compute_composite_score(
     Returns:
         Composite score in [0, 1].
     """
-    # Hard gate: not enough history or trades
+    # Hard gates
     if trade_count < _MIN_TRADES:
         return 0.0
     if len(monthly_pnl_history) < _MIN_MONTHS_ACTIVE:
         return 0.0
+
+    # Recency multiplier — kills score for dormant traders before computing anything else
+    recency_mult = _compute_recency_multiplier(last_active_at)
+    if recency_mult == 0.0:
+        return 0.0  # Don't bother computing — they're dormant
 
     months_active = len([m for m in monthly_pnl_history if m.get("pnl", 0) != 0])
     trades_per_month = trade_count / max(months_active, 1)
@@ -170,22 +186,20 @@ def compute_composite_score(
     consistency = _compute_consistency_score(monthly_pnl_history)
     sharpe_norm = _compute_sharpe_normalized(monthly_pnl_history)
     diversity = _compute_diversity_score(monthly_pnl_history, trade_count)
-    recency = _compute_recency_score(last_active_at)
     frequency = _compute_frequency_score(trades_per_month)
     streak_bonus = _compute_winning_streak_bonus(monthly_pnl_history)
 
     base_score = (
-        consistency * 0.50
-        + sharpe_norm * 0.20
+        consistency * 0.60
+        + sharpe_norm * 0.25
         + diversity * 0.15
-        + recency * 0.10
-        + frequency * 0.05
     )
-    score = min(base_score + streak_bonus, 1.0)
+    # Recency is a multiplier — dormant traders get crushed
+    score = min((base_score + streak_bonus) * recency_mult, 1.0)
 
     logger.debug(
-        "Score: consistency=%.2f sharpe=%.2f diversity=%.2f recency=%.2f freq=%.2f streak=%.2f → %.3f",
-        consistency, sharpe_norm, diversity, recency, frequency, streak_bonus, score,
+        "Score: consistency=%.2f sharpe=%.2f diversity=%.2f freq=%.2f streak=%.2f recency_mult=%.2f → %.3f",
+        consistency, sharpe_norm, diversity, frequency, streak_bonus, recency_mult, score,
     )
     return round(score, 4)
 
@@ -340,7 +354,11 @@ async def _score_candidate(address: str, entry: dict) -> Optional[tuple[float, d
         extra_stats = _compute_extra_stats(trades, weekly_history)
         last_trade_ts = _parse_trade_ts(trades[0]) if trades else None
 
-        # Hard gates — bypassed for VIP traders
+        # Universal hard gate: inactive traders can't be copied
+        if _compute_recency_multiplier(last_trade_ts) == 0.0:
+            return None  # >60 days inactive — skip entirely
+
+        # Additional gates bypassed for VIP traders
         if not is_vip:
             if len(trades) < _MIN_TRADES:
                 return None
@@ -348,10 +366,14 @@ async def _score_candidate(address: str, entry: dict) -> Optional[tuple[float, d
                 return None
 
         if is_vip and len(monthly_history) < _MIN_MONTHS_ACTIVE:
-            # VIP with short history: give base score from rank
-            score = max(0.5, 1.0 - (leaderboard_rank / 100))
-            logger.info("VIP bypass for %s (rank=%d, PnL=$%.0f, vol=$%.0f) score=%.3f",
-                        address[:16], leaderboard_rank, leaderboard_pnl, leaderboard_vol, score)
+            # VIP with short history: base score 0.5, but recency still applies as multiplier
+            recency_mult = _compute_recency_multiplier(last_trade_ts)
+            if recency_mult == 0.0:
+                logger.info("VIP %s skipped — inactive >60d despite rank=%d", address[:16], leaderboard_rank)
+                return None  # Even VIPs can't be copied if dormant
+            score = round(0.5 * recency_mult, 4)
+            logger.info("VIP bypass for %s (rank=%d, PnL=$%.0f) recency_mult=%.2f → score=%.3f",
+                        address[:16], leaderboard_rank, leaderboard_pnl, recency_mult, score)
         else:
             score = compute_composite_score(
                 monthly_pnl_history=monthly_history,
