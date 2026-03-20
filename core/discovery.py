@@ -23,11 +23,13 @@ from db.session import get_session
 
 logger = logging.getLogger(__name__)
 
-_ACTIVE_N = 50       # Traders polled every 30s (real monitoring)
-_WATCHING_N = 500    # Max stored in DB for scoring/reference
-_SCORE_THRESHOLD = 0.25   # Minimum score to stay active
-_MIN_TRADES = 30          # Require at least 30 total trades
-_MIN_MONTHS_ACTIVE = 3    # Require at least 3 months of history
+_ACTIVE_SCORE_THRESHOLD = 0.30  # Score needed to be actively monitored (polled every 30s)
+_WATCHING_N = 500               # Max stored in DB for scoring/reference
+_SCORE_THRESHOLD = 0.25         # Minimum score to stay in DB at all
+_MIN_TRADES = 30                # Require at least 30 total trades
+_MIN_MONTHS_ACTIVE = 3          # Require at least 3 months of history
+# No hard cap on active traders — everyone above _ACTIVE_SCORE_THRESHOLD gets polled.
+# In practice, expect 100-300 qualifying traders. Even 500 × 1 poll/30s = 16 req/sec, fine.
 
 # All Polymarket categories to pull from
 _CATEGORIES = [
@@ -350,8 +352,13 @@ async def discover_top_traders() -> None:
     scored.sort(key=lambda x: x[0], reverse=True)
 
     top_watching = scored[:_WATCHING_N]
-    top_active_addresses = {d["address"] for _, d in scored[:_ACTIVE_N]}
+    # All traders above threshold become active — no arbitrary cap
+    top_active_addresses = {d["address"] for s, d in top_watching if s >= _ACTIVE_SCORE_THRESHOLD}
     top_watching_addresses = {d["address"] for _, d in top_watching}
+    logger.info(
+        "%d traders scored above active threshold (%.2f), %d total in watching pool",
+        len(top_active_addresses), _ACTIVE_SCORE_THRESHOLD, len(top_watching),
+    )
 
     async with get_session() as session:
         trader_repo = TraderRepo(session)
@@ -386,19 +393,22 @@ async def discover_top_traders() -> None:
                 categories_json=None,
             )
 
-    active_count = len([s for s, d in top_watching if d["address"] in top_active_addresses])
+    active_count = sum(1 for s, d in top_watching if d["address"] in top_active_addresses)
     watching_count = len(top_watching) - active_count
     logger.info(
-        "Discovery complete: %d active (will be polled), %d watching (scored, not polled)",
+        "Discovery complete: %d active (polled every 30s), %d watching (scored, not polled)",
         active_count, watching_count,
     )
 
-    # Log top 10 for visibility
-    for i, (score, data) in enumerate(scored[:10], 1):
+    # Log top 20 for visibility
+    for i, (score, data) in enumerate(scored[:20], 1):
         name = data.get("display_name") or data["address"][:12]
+        status = "ACTIVE" if data["address"] in top_active_addresses else "watching"
         logger.info(
-            "  #%d %s — score=%.3f trades=%d pnl=$%.0f",
-            i, name, score, data["trade_count"], data["total_pnl"],
+            "  #%d [%s] %s — score=%.3f trades=%d consistency=%s",
+            i, status, name, score, data["trade_count"],
+            f"{sum(1 for m in data['monthly_pnl_history'][-6:] if m.get('pnl',0)>0)}/6mo"
+            if data.get("monthly_pnl_history") else "?",
         )
 
 
@@ -455,8 +465,9 @@ async def refresh_tracked_traders() -> None:
 
     # Sort by new score, assign statuses
     updated.sort(key=lambda x: x[1], reverse=True)
-    active_addresses = {t.address for t, _ in updated[:_ACTIVE_N]}
-    watching_addresses = {t.address for t, _ in updated[_ACTIVE_N:_WATCHING_N]}
+    # Active = all above threshold (no arbitrary cap)
+    active_addresses = {t.address for t, s in updated if s >= _ACTIVE_SCORE_THRESHOLD}
+    watching_addresses = {t.address for t, s in updated[:_WATCHING_N] if t.address not in active_addresses}
 
     async with get_session() as session:
         trader_repo = TraderRepo(session)
@@ -486,7 +497,7 @@ async def refresh_tracked_traders() -> None:
                 score=score,
             )
 
-    if active_count < _ACTIVE_N // 2:
+    if active_count < 10:
         logger.info("Active traders dropped to %d — triggering fresh discovery", active_count)
         await discover_top_traders()
     else:
