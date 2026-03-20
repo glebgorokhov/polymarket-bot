@@ -1,6 +1,6 @@
 python-telegram-bot==20.7
-py-clob-client>=0.16.0
-httpx==0.27.0
+py-clob-client==0.34.6
+httpx[http2]==0.27.0
 sqlalchemy[asyncio]==2.0.30
 asyncpg==0.29.0
 alembic==1.13.1
