@@ -181,7 +181,7 @@ async def get_market_info(condition_ids: list[str]) -> dict[str, MarketInfo]:
             cid = m.get("conditionId", "")
             if not cid:
                 continue
-            closed = bool(m.get("closed", False)) and not bool(m.get("active", True))
+            closed = bool(m.get("closed", False))
             raw_prices = m.get("outcomePrices", [])
             prices: list[float] = []
             for p in raw_prices:
