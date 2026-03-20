@@ -858,7 +858,7 @@ async def cmd_simulate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     try:
         from api.data_api import DataApiClient
-        from core.simulator import run_simulations
+        from core.simulator import run_full_simulation, FIXED_TRADES_EXPECTED
         from db.repos.traders import TraderRepo
 
         async with get_session() as session:
@@ -874,20 +874,23 @@ async def cmd_simulate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await update.message.reply_text("No traders with known PnL yet. Run /discover first.")
             return
 
-        async with DataApiClient() as data_client:
-            results = await run_simulations(candidates, data_client, budget=budget)
+        from core.simulator import run_full_simulation
 
-        if not results:
+        async with DataApiClient() as data_client:
+            sim = await run_full_simulation(candidates, data_client, budget=budget)
+
+        if not sim.per_trader and not any(sim.strategies.values()):
             await update.message.reply_text(
-                "❌ No simulation results — either no closed markets yet or market data unavailable."
+                "❌ No simulation results — either no closed markets or market data unavailable.\n"
+                "Make sure /discover has run and traders have resolved positions."
             )
             return
 
-        # Save results back to category_strengths
+        # Save per-trader results to category_strengths
         async with get_session() as session:
             repo = TraderRepo(session)
             for trader in candidates:
-                res = results.get(trader.address)
+                res = sim.per_trader.get(trader.address)
                 if not res:
                     continue
                 extra = dict(trader.category_strengths or {})
@@ -902,24 +905,76 @@ async def cmd_simulate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 }
                 await repo.update(trader.address, category_strengths=extra)
 
-        # Build leaderboard sorted by sim PnL
-        ranked = sorted(results.items(), key=lambda x: -x[1].our_pnl)
-
-        lines = [f"📊 <b>Backtest Results</b> — $50 starting budget\n"]
-        for i, (addr, res) in enumerate(ranked[:20], 1):
-            trader = next((t for t in candidates if t.address == addr), None)
-            name = (trader.display_name if trader else None) or addr[:12] + "…"
+        # ── Per-trader leaderboard ──────────────────────────────────────────
+        ranked = sorted(sim.per_trader.items(), key=lambda x: -x[1].our_pnl)
+        lines = [f"📊 <b>Backtest: ${budget:.0f} starting budget</b>\n"]
+        lines.append("<b>── Per-Trader (pure follow, proportional sizing) ──</b>")
+        for i, (addr, res) in enumerate(ranked[:12], 1):
             sign = "+" if res.our_pnl >= 0 else ""
             icon = "📈" if res.our_pnl >= 0 else "📉"
-            final = 50.0 + res.our_pnl
+            name = res.display_name or addr[:12] + "…"
+            final = budget + res.our_pnl
             lines.append(
-                f"{i}. {icon} <b>{name}</b>\n"
-                f"   ${50:.0f} → <b>${final:.2f}</b> ({sign}{res.our_pnl_pct:.1f}%) in {res.simulated_days}d\n"
-                f"   {res.won_markets}W / {res.lost_markets}L ({res.total_markets} closed mkts)"
+                f"{i}. {icon} <b>{name}</b>  "
+                f"${budget:.0f}→<b>${final:.2f}</b> ({sign}{res.our_pnl_pct:.1f}%) "
+                f"in {res.simulated_days}d  [{res.won_markets}W/{res.lost_markets}L]"
+            )
+
+        # ── Strategy comparison ────────────────────────────────────────────
+        lines.append("\n<b>── Strategy Comparison (proportional sizing) ──</b>")
+        strategy_labels = {
+            "pure_follow": "Pure Follow (all trades)",
+            "whale":       "Whale only  (≥5% portfolio)",
+            "consensus":   "Consensus   (2+ traders agree)",
+            "recency":     f"Recency     (last {60}d only)",
+        }
+        strat_sorted = sorted(sim.strategies.items(), key=lambda x: -x[1].our_pnl)
+        for slug, res in strat_sorted:
+            sign = "+" if res.our_pnl >= 0 else ""
+            icon = "📈" if res.our_pnl >= 0 else "📉"
+            label = strategy_labels.get(slug, slug)
+            wr = f"{res.win_rate * 100:.0f}% WR" if res.total_bets else "no bets"
+            lines.append(
+                f"{icon} {label}\n"
+                f"   {sign}${res.our_pnl:.2f} ({sign}{res.our_pnl_pct:.1f}%)  "
+                f"{res.total_bets} bets  {wr}"
+            )
+
+        # ── Sizing comparison ──────────────────────────────────────────────
+        lines.append("\n<b>── Sizing Models (pure follow strategy) ──</b>")
+        sizing_labels = {
+            "proportional": "Proportional (mirror their bet %)",
+            "fixed":        f"Fixed        (${budget/FIXED_TRADES_EXPECTED:.1f} flat per bet)",
+            "conviction":   "Conviction   (bigger bets on cheap options)",
+        }
+        size_sorted = sorted(sim.sizing.items(), key=lambda x: -x[1].our_pnl)
+        for slug, res in size_sorted:
+            sign = "+" if res.our_pnl >= 0 else ""
+            icon = "📈" if res.our_pnl >= 0 else "📉"
+            label = sizing_labels.get(slug, slug)
+            lines.append(
+                f"{icon} {label}\n"
+                f"   {sign}${res.our_pnl:.2f} ({sign}{res.our_pnl_pct:.1f}%)  {res.total_bets} bets"
+            )
+
+        # ── Best combo ────────────────────────────────────────────────────
+        if sim.matrix:
+            best_combo = max(sim.matrix.items(), key=lambda x: x[1].our_pnl)
+            (best_s, best_z), best_res = best_combo
+            sign = "+" if best_res.our_pnl >= 0 else ""
+            lines.append(
+                f"\n🏆 <b>Best combo: {best_s} + {best_z}</b>\n"
+                f"   {sign}${best_res.our_pnl:.2f} ({sign}{best_res.our_pnl_pct:.1f}%) "
+                f"on {best_res.total_bets} bets"
             )
 
         lines.append("\n✅ Results saved — /traders now shows sim P&amp;L on each card.")
-        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+        text = "\n".join(lines)
+        # Split if too long (Telegram 4096 char limit)
+        if len(text) > 3800:
+            await update.message.reply_text(text[:3800] + "\n…", parse_mode="HTML")
+        else:
+            await update.message.reply_text(text, parse_mode="HTML")
 
     except Exception as exc:
         logger.error("Simulation failed: %s", exc, exc_info=True)
