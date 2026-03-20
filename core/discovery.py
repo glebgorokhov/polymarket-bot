@@ -192,9 +192,14 @@ def compute_composite_score(
         profitable_months = sum(1 for m in monthly_pnl_history[-6:] if m.get("pnl", 0) > 0)
         win_rate = profitable_months / max(len(monthly_pnl_history[-6:]), 1)
 
-    # Hard gate: <40% win rate = not worth tracking
-    if win_rate < 0.40:
-        return 0.0
+    # Hard gates on win rate AND monthly consistency
+    if win_rate < 0.50:
+        return 0.0  # Below 50% weekly win rate = no edge, not worth tracking
+
+    monthly_profitable = sum(1 for m in monthly_pnl_history[-6:] if m.get("pnl", 0) > 0)
+    total_recent_months = min(len(monthly_pnl_history), 6)
+    if total_recent_months >= 4 and monthly_profitable < 3:
+        return 0.0  # Less than 3/4+ profitable months = not consistently good
 
     # Recent form: last 8 weeks
     recent_8 = weekly[-8:] if len(weekly) >= 4 else []
@@ -217,9 +222,13 @@ def compute_composite_score(
             break
     streak_bonus = min(streak * 0.025, 0.15)
 
+    # Recent form weight scales with win_rate — a hot streak on a bad trader isn't signal
+    recent_form_weight = 0.30 * min(win_rate / 0.65, 1.0)  # Full weight only at 65%+ win rate
+    win_rate_weight = 0.55 + (0.30 - recent_form_weight)    # Excess goes to win_rate
+
     base_score = (
-        win_rate * 0.55
-        + recent_form * 0.30
+        win_rate * win_rate_weight
+        + recent_form * recent_form_weight
         + diversity * 0.15
     )
     score = min((base_score + streak_bonus) * recency_mult, 1.0)

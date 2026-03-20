@@ -322,13 +322,15 @@ async def _send_traders_page(update: Update, page: int) -> None:
         await update.message.reply_text("No traders tracked yet. Discovery may still be running.")
         return
 
-    active = [t for t in traders if t.status == "active"]
-    watching = [t for t in traders if t.status == "watching"]
-    inactive = [t for t in traders if t.status == "inactive"]
+    active = sorted([t for t in traders if t.status == "active"], key=lambda t: (-(t.score or 0), -(t.win_rate or 0)))
+    watching = sorted([t for t in traders if t.status == "watching"], key=lambda t: (-(t.score or 0), -(t.win_rate or 0)))
+    inactive = sorted([t for t in traders if t.status == "inactive"], key=lambda t: -(t.score or 0))
 
-    total_pages = max(1, (len(traders) + _TRADERS_PER_PAGE - 1) // _TRADERS_PER_PAGE)
+    # Active first, then watching, then inactive — each group sorted by score+win_rate
+    all_sorted = active + watching + inactive
+    total_pages = max(1, (len(all_sorted) + _TRADERS_PER_PAGE - 1) // _TRADERS_PER_PAGE)
     start = (page - 1) * _TRADERS_PER_PAGE
-    page_traders = traders[start : start + _TRADERS_PER_PAGE]
+    page_traders = all_sorted[start : start + _TRADERS_PER_PAGE]
 
     lines = [
         f"👥 <b>Tracked Traders</b> — page {page}/{total_pages}\n"
