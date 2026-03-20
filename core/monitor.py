@@ -75,6 +75,8 @@ async def validate_signal(
             end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
             now = datetime.now(timezone.utc)
             hours_remaining = (end_date - now).total_seconds() / 3600
+            if hours_remaining < 0:
+                return False, "market_already_resolved"
             if hours_remaining <= _RESOLVE_SOON_HOURS:
                 return False, f"resolving_in_{hours_remaining:.1f}h"
     except Exception as exc:
@@ -334,6 +336,8 @@ async def _process_trade(
             signal=signal,
             action="skipped",
             skip_reason=skip_reason,
+            trader_name=trader.display_name or trader.address[:12] + "…",
+            market_name=market_name,
         ))
         return
 

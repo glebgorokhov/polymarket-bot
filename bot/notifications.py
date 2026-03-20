@@ -87,52 +87,113 @@ def trader_removed(trader: Any, reason: str) -> str:
     )
 
 
-def signal_detected_manual(signal: Any, triggered_slugs: list, market_name: str) -> str:
+def signal_detected_manual(
+    signal: Any,
+    triggered_slugs: list,
+    market_name: str,
+    trader_name: Optional[str] = None,
+    event_slug: Optional[str] = None,
+) -> str:
     """
     Notification for manual mode — lists all strategies that wanted to copy.
     User can decide whether to act manually.
     """
-    side_icon = "🔵" if signal.side == "BUY" else "🔴"
-    strat_lines = "\n".join(f"  · {slug}" for slug in triggered_slugs)
+    side_icon = "🟢" if signal.side == "BUY" else "🔴"
+    strat_labels = {"pure_follow": "Pure Follow", "consensus": "Consensus", "whale": "Whale", "conviction": "Conviction"}
+    strat_lines = "  · " + "\n  · ".join(strat_labels.get(s, s) for s in triggered_slugs)
+
+    cond_id = signal.market_condition_id or ""
+    market_url = f"https://polymarket.com/event/{event_slug or cond_id}"
+    short_name = (market_name or cond_id[:20])[:65]
+    if market_name and len(market_name) > 65:
+        short_name += "…"
+
+    trader_line = f"👤 <b>{trader_name}</b>\n" if trader_name else ""
+
     return (
-        f"⚠️ <b>Signal — manual review needed</b>\n"
+        f"🚨 <b>Signal — action needed</b>\n"
+        f"{trader_line}"
+        f"🏪 <a href=\"{market_url}\">{short_name}</a>\n"
+        f"{side_icon} {signal.side} @ <b>{signal.price:.3f}</b>  💵 ${signal.size_usd:.2f}\n"
         f"\n"
-        f"{side_icon} <b>{market_name}</b>\n"
-        f"📈 {signal.side} @ <b>{signal.price:.4f}</b> · ${signal.size_usd:.2f}\n"
+        f"Strategies triggered:\n{strat_lines}\n"
         f"\n"
-        f"Triggered by {len(triggered_slugs)} {'strategy' if len(triggered_slugs) == 1 else 'strategies'}:\n"
-        f"{strat_lines}\n"
-        f"\n"
-        f"Switch to /mode paper or /mode auto to let me handle this."
+        f"Use /mode paper or /mode auto to copy automatically."
     )
 
 
-def trade_opened_multi(position: Any, triggered_slugs: list, mode: str) -> str:
+def trade_opened_multi(
+    position: Any,
+    triggered_slugs: list,
+    mode: str,
+    trader_name: Optional[str] = None,
+    event_slug: Optional[str] = None,
+) -> str:
     """
     Notification when a position is opened, showing all strategies that triggered.
     """
     mode_icon = "✅" if mode == "auto" else "📄"
     mode_label = "Trade placed" if mode == "auto" else "Paper trade"
-    shadow_count = len(triggered_slugs) - 1
-    primary_slug = triggered_slugs[0] if triggered_slugs else "unknown"
+    side_icon = "🟢" if position.side == "BUY" else "🔴"
 
-    shadow_note = (
-        f"\n👁️ {shadow_count} more {'strategy' if shadow_count == 1 else 'strategies'} shadow-tracking: "
-        + ", ".join(triggered_slugs[1:])
-        if shadow_count > 0 else ""
-    )
+    cond_id = getattr(position, "market_condition_id", "") or ""
+    market_url = f"https://polymarket.com/event/{event_slug or cond_id}"
+    market_display = (position.market_name or cond_id[:20])[:60]
+
+    trader_line = f"👤 Copying <b>{trader_name}</b>\n" if trader_name else ""
 
     return (
         f"{mode_icon} <b>{mode_label}</b>\n"
-        f"\n"
-        f"🏪 {position.market_name}\n"
-        f"📈 {position.side} @ {position.entry_price:.4f} · ${position.size_usd:.2f}\n"
-        f"🎯 Primary: <b>{primary_slug}</b>{shadow_note}\n"
+        f"{trader_line}"
+        f"🏪 <a href=\"{market_url}\">{market_display}</a>\n"
+        f"{side_icon} {position.side} @ <b>{position.entry_price:.3f}</b>  💵 ${position.size_usd:.2f}\n"
+        f"🎯 {' + '.join(triggered_slugs)}\n"
         f"🆔 Position #{position.id}"
     )
 
 
-def signal_detected(signal: Any, action: str, skip_reason: Optional[str] = None) -> str:
+def _format_skip_reason(reason: Optional[str]) -> str:
+    """Convert raw skip reason codes to human-readable text."""
+    if not reason:
+        return "Unknown"
+    # resolving_in_-12345.6h → already resolved
+    if reason.startswith("resolving_in_-"):
+        return "Market already resolved"
+    # resolving_in_5.3h → resolves in 5h (too soon)
+    if reason.startswith("resolving_in_"):
+        hours = reason.replace("resolving_in_", "").replace("h", "")
+        try:
+            h = float(hours)
+            return f"Resolves in {h:.0f}h (too soon)"
+        except ValueError:
+            pass
+    if reason == "missing_market_id":
+        return "Could not identify market"
+    if reason == "market_not_found":
+        return "Market not found on Polymarket"
+    if reason == "market_not_active":
+        return "Market is closed/inactive"
+    if reason.startswith("spread_too_wide"):
+        spread_pct = reason.replace("spread_too_wide_", "")
+        return f"Bid-ask spread too wide ({spread_pct})"
+    if reason.startswith("price_stale"):
+        return "Price data stale (>15 min)"
+    if reason == "sell_no_position":
+        return "SELL with no open position (exit trade)"
+    if reason.startswith("market_check_error"):
+        return "Market check failed (API error)"
+    if reason.startswith("risk:"):
+        return f"Risk limit: {reason[5:]}"
+    return reason.replace("_", " ")
+
+
+def signal_detected(
+    signal: Any,
+    action: str,
+    skip_reason: Optional[str] = None,
+    trader_name: Optional[str] = None,
+    market_name: Optional[str] = None,
+) -> str:
     """
     Format a message for a detected trade signal.
 
@@ -140,23 +201,39 @@ def signal_detected(signal: Any, action: str, skip_reason: Optional[str] = None)
         signal: Signal ORM object.
         action: "copied", "skipped", or "manual".
         skip_reason: Reason if skipped.
+        trader_name: Display name of the trader.
+        market_name: Human-readable market question.
 
     Returns:
         Formatted notification string.
     """
     action_icons = {"copied": "✅", "skipped": "⏭️", "manual": "⚠️"}
     icon = action_icons.get(action, "📡")
-    action_label = action.upper()
 
-    msg = (
-        f"{icon} <b>Signal {action_label}</b>\n"
-        f"🏪 Market: <code>{signal.market_condition_id[:20]}...</code>\n"
-        f"📈 Side: {signal.side} @ {signal.price:.4f}\n"
-        f"💵 Size: ${signal.size_usd:.2f}"
-    )
-    if skip_reason:
-        msg += f"\n⚠️ Reason: {skip_reason}"
-    return msg
+    side_icon = "🟢" if signal.side == "BUY" else "🔴"
+    name = trader_name or "Unknown trader"
+
+    # Market display: use name if available, otherwise short conditionId
+    cond_id = signal.market_condition_id or ""
+    if market_name and market_name != "Unknown Market":
+        market_display = market_name[:60] + ("…" if len(market_name) > 60 else "")
+    else:
+        market_display = cond_id[:20] + "…"
+
+    # Build polymarket link from eventSlug if we have conditionId
+    market_url = f"https://polymarket.com/event/{cond_id}" if cond_id else ""
+
+    lines = [f"{icon} <b>Signal from {name}</b>"]
+    if market_url:
+        lines.append(f"🏪 <a href=\"{market_url}\">{market_display}</a>")
+    else:
+        lines.append(f"🏪 {market_display}")
+    lines.append(f"{side_icon} {signal.side} @ <b>{signal.price:.3f}</b>  💵 ${signal.size_usd:.2f}")
+
+    if action == "skipped" and skip_reason:
+        lines.append(f"⏭️ Skipped: {_format_skip_reason(skip_reason)}")
+
+    return "\n".join(lines)
 
 
 def trade_opened(position: Any, strategy_name: str) -> str:
