@@ -446,9 +446,9 @@ async def discover_top_traders() -> None:
                 # Never downgrade pinned traders
                 if existing.is_pinned:
                     new_status = "active"
-                await trader_repo.upsert(address, {**data, "status": new_status})
+                await trader_repo.upsert(address, **{**data, "status": new_status})
             else:
-                await trader_repo.upsert(address, {**data, "status": new_status})
+                await trader_repo.upsert(address, **{**data, "status": new_status})
 
         # Downgrade traders no longer in top set (unless pinned)
         for address, trader in existing_traders.items():
@@ -457,7 +457,7 @@ async def discover_top_traders() -> None:
                     logger.info("Pinned trader %s not in new top set — keeping active", address[:16])
                     continue
                 logger.info("Downgrading %s → watching (dropped from top set)", address[:16])
-                await trader_repo.upsert(address, {"status": "watching"})
+                await trader_repo.upsert(address, status="watching")
 
         active_count = sum(1 for s, d in top_watching if d["score"] >= _ACTIVE_SCORE_THRESHOLD)
         logger.info(
@@ -515,7 +515,7 @@ async def refresh_trader_scores() -> None:
                 data["status"] = "active"
             else:
                 data["status"] = "active" if score >= _ACTIVE_SCORE_THRESHOLD else "watching"
-            await trader_repo.upsert(address, data)
+            await trader_repo.upsert(address, **data)
         await session.commit()
 
     logger.info("Refreshed %d trader scores", len(updates))

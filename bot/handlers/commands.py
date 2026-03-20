@@ -877,11 +877,50 @@ async def cmd_discover(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text(f"❌ Discovery failed: {exc}")
 
 
+async def _build_chart_url(weekly_points: list, budget: float, title: str) -> Optional[str]:
+    """
+    Build QuickChart.io URL for weekly balance growth chart.
+    Returns URL string or None on failure.
+    """
+    import json as _json, urllib.parse as _up
+    if not weekly_points or len(weekly_points) < 2:
+        return None
+    labels = [p.week_label for p in weekly_points]
+    data = [p.balance for p in weekly_points]
+    cfg = {
+        "type": "line",
+        "data": {
+            "labels": labels,
+            "datasets": [{
+                "label": "Balance ($)",
+                "data": data,
+                "fill": True,
+                "backgroundColor": "rgba(0,200,100,0.15)",
+                "borderColor": "rgba(0,200,100,1)",
+                "pointRadius": 2,
+                "tension": 0.3,
+            }],
+        },
+        "options": {
+            "title": {"display": True, "text": title},
+            "scales": {
+                "yAxes": [{"ticks": {"callback": "function(v){return '$'+v.toFixed(0)}"}}]
+            },
+        },
+    }
+    chart_str = _json.dumps(cfg, separators=(",", ":"))
+    encoded = _up.quote(chart_str)
+    url = f"https://quickchart.io/chart?c={encoded}&width=600&height=300&bkg=white"
+    return url if len(url) < 8000 else None
+
+
 async def cmd_simulate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Handle /simulate. Runs backtest on all active/watching traders.
-    Simulates copying their trades proportionally from a $50 budget.
-    Saves results and displays a leaderboard of simulated PnL.
+    Handle /simulate [N].
+    Runs compound-growth backtest on top N traders (default 50).
+    Produces: equity curve chart, weekly P&L projection, per-trader leaderboard,
+    strategy + sizing comparison.
+    Bet sizes grow with balance (compound/reinvestment mode).
     """
     if not _is_admin(update):
         return
@@ -889,25 +928,24 @@ async def cmd_simulate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     cfg = get_settings()
     budget = float(cfg.per_trade_budget or 50.0) if hasattr(cfg, "per_trade_budget") else 50.0
 
-    # Parse optional limit arg: /simulate 20 → top 20 by score
     args = context.args or []
     limit = int(args[0]) if args and args[0].isdigit() else 50
 
     await update.message.reply_text(
-        f"🔬 Running backtest on top {limit} traders by score...\n"
-        f"Fetching trade history + checking market resolutions. May take a few minutes.\n"
-        f"Tip: /simulate 10 for a quicker run on top 10 only."
+        f"🔬 Running <b>compound backtest</b> on top {limit} traders...\n"
+        f"Bet sizes grow with balance (reinvestment mode).\n"
+        f"Fetching trade history + market resolutions...",
+        parse_mode="HTML",
     )
 
     try:
         from api.data_api import DataApiClient
-        from core.simulator import run_full_simulation, FIXED_TRADES_EXPECTED
+        from core.simulator import run_full_simulation, FIXED_TRADES_EXPECTED, WeeklyPoint
         from db.repos.traders import TraderRepo
 
         async with get_session() as session:
             all_traders = list(await TraderRepo(session).get_all())
 
-        # Only simulate active + watching with known PnL, top N by score
         candidates = sorted(
             [t for t in all_traders if t.status in ("active", "watching") and (t.total_pnl or 0) > 0],
             key=lambda t: -(t.score or 0),
@@ -917,19 +955,18 @@ async def cmd_simulate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await update.message.reply_text("No traders with known PnL yet. Run /discover first.")
             return
 
-        from core.simulator import run_full_simulation
-
         async with DataApiClient() as data_client:
-            sim = await run_full_simulation(candidates, data_client, budget=budget)
+            sim = await run_full_simulation(candidates, data_client, budget=budget, compound=True)
 
-        if not sim.per_trader and not any(sim.strategies.values()):
+        if not sim.per_trader:
             await update.message.reply_text(
-                "❌ No simulation results — either no closed markets or market data unavailable.\n"
-                "Make sure /discover has run and traders have resolved positions."
+                "❌ No simulation results — no closed markets found in traders' history.\n"
+                "Most tracked traders are intraday; their markets resolve throughout the day.\n"
+                "Try again later (2+ PM Helsinki) or /discover to find more traders."
             )
             return
 
-        # Save per-trader results to category_strengths
+        # Save per-trader results
         async with get_session() as session:
             repo = TraderRepo(session)
             for trader in candidates:
@@ -940,84 +977,151 @@ async def cmd_simulate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 extra["sim"] = {
                     "pnl": res.our_pnl,
                     "pnl_pct": res.our_pnl_pct,
+                    "final_balance": res.final_balance,
                     "days": res.simulated_days,
                     "total_markets": res.total_markets,
                     "won": res.won_markets,
                     "lost": res.lost_markets,
+                    "bets_per_month": res.bets_per_month,
+                    "cagr": round(res.cagr, 1),
                     "budget": budget,
                 }
                 await repo.update(trader.address, category_strengths=extra)
+            await session.commit()
 
-        # ── Per-trader leaderboard ──────────────────────────────────────────
-        ranked = sorted(sim.per_trader.items(), key=lambda x: -x[1].our_pnl)
-        lines = [f"📊 <b>Backtest: ${budget:.0f} starting budget</b>\n"]
-        lines.append("<b>── Per-Trader (pure follow, proportional sizing) ──</b>")
+        # ── Best strategy for chart ──────────────────────────────────────
+        best_combo = sim.best_combo
+        best_strat_result = sim.strategies.get("pure_follow")
+
+        # ── Chart: aggregate balance over weeks (best strategy) ──────────
+        if best_strat_result and best_strat_result.weekly_timeline:
+            chart_url = await _build_chart_url(
+                best_strat_result.weekly_timeline,
+                budget,
+                f"Compound equity curve — pure follow + conviction (${budget:.0f} start)",
+            )
+            if chart_url:
+                try:
+                    import httpx as _hx
+                    async with _hx.AsyncClient() as hc:
+                        img_resp = await hc.get(chart_url, timeout=15)
+                    if img_resp.status_code == 200:
+                        await update.message.reply_photo(
+                            photo=img_resp.content,
+                            caption="📈 Compound equity curve (all traders combined, pure follow strategy)",
+                        )
+                except Exception as chart_exc:
+                    logger.warning("Chart generation failed: %s", chart_exc)
+
+        # ── Per-trader leaderboard ────────────────────────────────────────
+        # Sort by CAGR if we have enough days, else by final balance
+        ranked = sorted(
+            sim.per_trader.items(),
+            key=lambda x: -(x[1].cagr if x[1].simulated_days >= 30 else x[1].final_balance),
+        )
+
+        lines = [f"📊 <b>Compound Backtest — ${budget:.0f} start (reinvestment on)</b>\n"]
+        lines.append("<b>── Per-Trader (pure follow, proportional, compounded) ──</b>")
         for i, (addr, res) in enumerate(ranked[:12], 1):
-            sign = "+" if res.our_pnl >= 0 else ""
             icon = "📈" if res.our_pnl >= 0 else "📉"
             name = res.display_name or addr[:12] + "…"
-            final = budget + res.our_pnl
+            cagr_str = f"  CAGR {res.cagr:+.0f}%/yr" if res.simulated_days >= 14 else ""
+            bpm_str = f"  {res.bets_per_month:.1f} bets/mo"
             lines.append(
-                f"{i}. {icon} <b>{name}</b>  "
-                f"${budget:.0f}→<b>${final:.2f}</b> ({sign}{res.our_pnl_pct:.1f}%) "
-                f"in {res.simulated_days}d  [{res.won_markets}W/{res.lost_markets}L]"
+                f"{i}. {icon} <b>{name}</b>\n"
+                f"   ${budget:.0f}→<b>${res.final_balance:.2f}</b> "
+                f"({res.our_pnl_pct:+.1f}%) in {res.simulated_days}d "
+                f"[{res.won_markets}W/{res.lost_markets}L]{cagr_str}{bpm_str}"
             )
 
-        # ── Strategy comparison ────────────────────────────────────────────
+        # ── Expected weekly P&L ───────────────────────────────────────────
+        pf = sim.strategies.get("pure_follow")
+        if pf and pf.weekly_timeline and len(pf.weekly_timeline) >= 3:
+            tl = pf.weekly_timeline
+            total_weeks = len(tl) - 1
+            start_bal = tl[0].balance
+            end_bal = tl[-1].balance
+            total_return_pct = (end_bal / start_bal - 1) * 100 if start_bal > 0 else 0
+            avg_weekly_return = total_return_pct / max(total_weeks, 1)
+            avg_bets_per_week = pf.bets_per_month / 4.33
+
+            lines.append(f"\n<b>── Expected Weekly P&amp;L (at ${budget:.0f} balance) ──</b>")
+            lines.append(
+                f"📅 ~{avg_bets_per_week:.1f} bets/week\n"
+                f"📊 Avg weekly return: <b>{avg_weekly_return:+.1f}%</b>\n"
+                f"💵 Avg weekly $: <b>${budget * avg_weekly_return / 100:+.2f}</b>\n"
+                f"⚡ At $500 balance: ~<b>${500 * avg_weekly_return / 100:+.2f}/week</b>\n"
+                f"⚡ At $5000 balance: ~<b>${5000 * avg_weekly_return / 100:+.2f}/week</b>\n"
+                f"<i>(scales with balance — compound mode)</i>"
+            )
+
+        # ── Strategy comparison ───────────────────────────────────────────
         lines.append("\n<b>── Strategy Comparison (proportional sizing) ──</b>")
         strategy_labels = {
             "pure_follow": "Pure Follow (all trades)",
-            "whale":       "Whale only  (≥5% portfolio)",
-            "consensus":   "Consensus   (2+ traders agree)",
-            "recency":     f"Recency     (last {60}d only)",
+            "whale":       "Whale only (≥5% portfolio)",
+            "consensus":   "Consensus (2+ traders agree)",
+            "recency":     "Recency (last 60d only)",
         }
-        strat_sorted = sorted(sim.strategies.items(), key=lambda x: -x[1].our_pnl)
-        for slug, res in strat_sorted:
+        for slug, res in sorted(sim.strategies.items(), key=lambda x: -x[1].final_balance):
             sign = "+" if res.our_pnl >= 0 else ""
             icon = "📈" if res.our_pnl >= 0 else "📉"
             label = strategy_labels.get(slug, slug)
             wr = f"{res.win_rate * 100:.0f}% WR" if res.total_bets else "no bets"
+            bpm = f"  {res.bets_per_month:.1f}/mo" if res.total_bets else ""
             lines.append(
-                f"{icon} {label}\n"
-                f"   {sign}${res.our_pnl:.2f} ({sign}{res.our_pnl_pct:.1f}%)  "
-                f"{res.total_bets} bets  {wr}"
+                f"{icon} <b>{label}</b>\n"
+                f"   ${budget:.0f}→${res.final_balance:.2f} ({sign}{res.our_pnl_pct:.1f}%) "
+                f"{res.total_bets} bets  {wr}{bpm}"
             )
 
-        # ── Sizing comparison ──────────────────────────────────────────────
+        # ── Sizing comparison ─────────────────────────────────────────────
         lines.append("\n<b>── Sizing Models (pure follow strategy) ──</b>")
         sizing_labels = {
             "proportional": "Proportional (mirror their bet %)",
-            "fixed":        f"Fixed        (${budget/FIXED_TRADES_EXPECTED:.1f} flat per bet)",
-            "conviction":   "Conviction   (bigger bets on cheap options)",
+            "fixed":        f"Fixed (${budget / FIXED_TRADES_EXPECTED:.1f} flat)",
+            "conviction":   "Conviction (cheap options × bonus)",
         }
-        size_sorted = sorted(sim.sizing.items(), key=lambda x: -x[1].our_pnl)
-        for slug, res in size_sorted:
+        for slug, res in sorted(sim.sizing.items(), key=lambda x: -x[1].final_balance):
             sign = "+" if res.our_pnl >= 0 else ""
             icon = "📈" if res.our_pnl >= 0 else "📉"
             label = sizing_labels.get(slug, slug)
             lines.append(
-                f"{icon} {label}\n"
-                f"   {sign}${res.our_pnl:.2f} ({sign}{res.our_pnl_pct:.1f}%)  {res.total_bets} bets"
+                f"{icon} <b>{label}</b>\n"
+                f"   ${budget:.0f}→${res.final_balance:.2f} ({sign}{res.our_pnl_pct:.1f}%) "
+                f"{res.total_bets} bets"
             )
 
         # ── Best combo ────────────────────────────────────────────────────
-        if sim.matrix:
-            best_combo = max(sim.matrix.items(), key=lambda x: x[1].our_pnl)
-            (best_s, best_z), best_res = best_combo
-            sign = "+" if best_res.our_pnl >= 0 else ""
+        if best_combo:
+            sign = "+" if best_combo.our_pnl >= 0 else ""
             lines.append(
-                f"\n🏆 <b>Best combo: {best_s} + {best_z}</b>\n"
-                f"   {sign}${best_res.our_pnl:.2f} ({sign}{best_res.our_pnl_pct:.1f}%) "
-                f"on {best_res.total_bets} bets"
+                f"\n🏆 <b>Best combo: {best_combo.strategy} + {best_combo.sizing}</b>\n"
+                f"   ${budget:.0f}→${best_combo.final_balance:.2f} "
+                f"({sign}{best_combo.our_pnl_pct:.1f}%) on {best_combo.total_bets} bets"
             )
 
-        lines.append("\n✅ Results saved — /traders now shows sim P&amp;L on each card.")
-        text = "\n".join(lines)
-        # Split if too long (Telegram 4096 char limit)
-        if len(text) > 3800:
-            await update.message.reply_text(text[:3800] + "\n…", parse_mode="HTML")
-        else:
-            await update.message.reply_text(text, parse_mode="HTML")
+        lines.append(
+            "\n✅ Results saved. Trade sizes grow with balance in /auto mode.\n"
+            "Use /traders to see sim P&amp;L per card."
+        )
+
+        # Send in chunks (HTML byte-safe)
+        full_text = "\n".join(lines)
+        chunks = []
+        current = ""
+        for line in lines:
+            candidate = current + ("\n" if current else "") + line
+            if len(candidate.encode("utf-8")) > 3800:
+                chunks.append(current)
+                current = line
+            else:
+                current = candidate
+        if current:
+            chunks.append(current)
+
+        for chunk in chunks:
+            await update.message.reply_text(chunk, parse_mode="HTML")
 
     except Exception as exc:
         logger.error("Simulation failed: %s", exc, exc_info=True)
