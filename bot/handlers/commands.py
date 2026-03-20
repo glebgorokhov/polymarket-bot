@@ -594,7 +594,9 @@ async def cmd_feed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 trades = await client.get_trades(user=trader.address, limit=5)
             result = []
             for t in trades:
-                slug = t.get("slug") or t.get("eventSlug") or t.get("marketSlug") or ""
+                # eventSlug = parent event page (what we want for the URL)
+                # slug = outcome-specific market slug (too specific, adds "-42-43f" etc)
+                slug = t.get("eventSlug") or t.get("slug") or t.get("marketSlug") or ""
                 result.append({
                     "trader_name": trader.display_name or trader.address[:12] + "…",
                     "trader_address": trader.address,
