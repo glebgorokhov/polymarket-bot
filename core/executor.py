@@ -25,6 +25,7 @@ def _get_clob_client() -> ClobApiClient:
     """Instantiate a CLOB client from current config."""
     cfg = get_settings()
     return ClobApiClient(
+        private_key=cfg.private_key,
         relayer_api_key=cfg.relayer_api_key,
         relayer_api_address=cfg.relayer_api_address,
         signer_address=cfg.signer_address,

@@ -171,6 +171,7 @@ async def poll_all_traders() -> None:
         return
 
     clob_client = ClobApiClient(
+        private_key=settings_cfg.private_key,
         relayer_api_key=settings_cfg.relayer_api_key,
         relayer_api_address=settings_cfg.relayer_api_address,
         signer_address=settings_cfg.signer_address,

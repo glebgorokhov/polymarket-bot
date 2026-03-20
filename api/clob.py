@@ -34,6 +34,7 @@ class ClobApiClient:
         relayer_api_key: str,
         relayer_api_address: str,
         signer_address: str,
+        private_key: str = "",
         relayer_api_secret: str = "",
         relayer_api_passphrase: str = "",
         funder_address: str = "",
@@ -50,13 +51,13 @@ class ClobApiClient:
             host: CLOB endpoint URL.
             chain_id: EVM chain ID (137 = Polygon mainnet).
         """
+        self._private_key = private_key  # hex private key for signing orders
         self._relayer_api_key = relayer_api_key
         self._relayer_api_secret = relayer_api_secret
         self._relayer_api_passphrase = relayer_api_passphrase
         self._relayer_api_address = relayer_api_address
         self._signer_address = signer_address
         # funder_address = the account wallet that holds USDC (may differ from signer)
-        # e.g. signer = 0x807b6... (relayer), funder = 0xc570... (Gleb's account)
         self._funder_address = funder_address or relayer_api_address
         self._host = host
         self._chain_id = chain_id
@@ -69,19 +70,41 @@ class ClobApiClient:
                 from py_clob_client.client import ClobClient
                 from py_clob_client.clob_types import ApiCreds
 
-                creds = ApiCreds(
-                    api_key=self._relayer_api_key,
-                    api_secret=self._relayer_api_secret,
-                    api_passphrase=self._relayer_api_passphrase,
-                )
+                if not self._private_key:
+                    raise RuntimeError(
+                        "PRIVATE_KEY is required to sign orders. "
+                        "Set the PRIVATE_KEY environment variable."
+                    )
+
+                # Use private key as the signing key (L1)
+                # signature_type=1 = POLY_PROXY (Magic Link / Google login)
+                # signature_type=2 = GNOSIS_SAFE (MetaMask login — most common)
+                # funder = the proxy wallet address shown on polymarket.com profile
+                creds = None
+                if self._relayer_api_secret and self._relayer_api_passphrase:
+                    creds = ApiCreds(
+                        api_key=self._relayer_api_key,
+                        api_secret=self._relayer_api_secret,
+                        api_passphrase=self._relayer_api_passphrase,
+                    )
+
                 self._client = ClobClient(
                     host=self._host,
                     chain_id=self._chain_id,
-                    key=self._signer_address,
+                    key=self._private_key,
                     creds=creds,
-                    signature_type=1,
-                    funder=self._funder_address,
+                    signature_type=2,  # GNOSIS_SAFE — standard for MetaMask users
+                    funder=self._funder_address or self._relayer_api_address,
                 )
+
+                # If no L2 creds provided, derive them from the private key
+                if creds is None:
+                    try:
+                        derived = self._client.create_or_derive_api_creds()
+                        self._client.set_api_creds(derived)
+                        logger.info("Derived L2 API credentials from private key")
+                    except Exception as exc:
+                        logger.warning("Could not derive L2 creds: %s — L1-only mode", exc)
             except ImportError as exc:
                 raise RuntimeError(
                     "py-clob-client is not installed. Add it to requirements.txt."

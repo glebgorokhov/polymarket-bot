@@ -18,9 +18,10 @@ class Settings(BaseSettings):
     )
 
     # Polymarket CLOB credentials
+    private_key: str = Field("", description="Private key of the proxy wallet signer (hex, 0x-prefixed)")
     relayer_api_key: str = Field(..., description="Polymarket CLOB relayer API key")
-    relayer_api_secret: str = Field("", description="Relayer API secret (for L2 HMAC auth)")
-    relayer_api_passphrase: str = Field("", description="Relayer API passphrase")
+    relayer_api_secret: str = Field("", description="Relayer API secret (derived from private_key if empty)")
+    relayer_api_passphrase: str = Field("", description="Relayer API passphrase (derived from private_key if empty)")
     relayer_api_address: str = Field(..., description="Relayer signer wallet address (0x807b6...)")
     signer_address: str = Field(..., description="Signer wallet address (same as relayer_api_address)")
     funder_address: str = Field("", description="Account wallet that holds the funds (0xc570...). Distinct from signer when using hosted relayer.")
