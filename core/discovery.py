@@ -314,10 +314,10 @@ async def discover_top_traders() -> None:
     1. Pull all leaderboard candidates across categories (up to ~500 unique)
     2. Score each one — heavily weight consistency
     3. Store top _WATCHING_N in DB as 'watching'
-    4. Promote top _ACTIVE_N to 'active' (these get polled every 30s)
+    4. Promote top _ACTIVE_SCORE_THRESHOLD to 'active' (these get polled every 30s)
     5. Downgrade existing active traders not in new top set
     """
-    logger.info("Starting full trader discovery (active=%d, watching=%d)", _ACTIVE_N, _WATCHING_N)
+    logger.info("Starting full trader discovery (score_threshold=%.2f, watching_cap=%d)", _ACTIVE_SCORE_THRESHOLD, _WATCHING_N)
 
     candidates = await _fetch_all_leaderboard_candidates()
     if not candidates:
@@ -417,7 +417,7 @@ async def refresh_tracked_traders() -> None:
     Weekly re-score all tracked traders and rotate active/watching.
 
     Re-scores each trader, promotes/demotes based on current performance.
-    Runs a fresh discovery if active count drops below half of _ACTIVE_N.
+    Runs a fresh discovery if active count drops below half of _ACTIVE_SCORE_THRESHOLD.
     """
     logger.info("Refreshing tracked traders")
 
