@@ -255,22 +255,20 @@ async def _send_traders_page(update: Update, page: int) -> None:
     page_traders = traders[start : start + _TRADERS_PER_PAGE]
 
     lines = [
-        f"👥 <b>Tracked Traders</b> (page {page}/{total_pages})\n"
-        f"🟢 {len(active)} active (monitored) · 🟡 {len(watching)} watching · 🔴 {len(inactive)} inactive\n"
+        f"👥 <b>Tracked Traders</b> — page {page}/{total_pages}\n"
+        f"🟢 {len(active)} monitored  🟡 {len(watching)} watching  🔴 {len(inactive)} inactive\n"
     ]
     for i, trader in enumerate(page_traders, start=start + 1):
-        name = trader.display_name or (trader.address[:10] + "...")
+        name = trader.display_name or trader.address[:12] + "…"
         status_icon = {"active": "🟢", "watching": "🟡", "inactive": "🔴"}.get(trader.status, "⚪")
         monthly = trader.monthly_pnl_history or []
-        # 30d PnL: last month's cash flow
-        pnl_30d = sum(m.get("pnl", 0) for m in monthly[-1:]) if monthly else trader.total_pnl
-        sign = "+" if pnl_30d >= 0 else ""
-        # Consistency: profitable months / total months
         profitable_months = sum(1 for m in monthly[-6:] if m.get("pnl", 0) > 0)
-        consistency = f"{profitable_months}/6mo" if len(monthly) >= 3 else "new"
+        total_months = min(len(monthly), 6)
+        consistency = f"{profitable_months}/{total_months}mo" if total_months >= 2 else "new"
+        profile_url = f"https://polymarket.com/profile/{trader.address}"
         lines.append(
-            f"{i}. {status_icon} <b>{name}</b>\n"
-            f"   Score: {trader.score:.3f} | Consistency: {consistency} | Trades: {trader.trade_count}"
+            f"{status_icon} <b><a href=\"{profile_url}\">{name}</a></b>\n"
+            f"    Score <b>{trader.score:.3f}</b> · {consistency} consistent · {trader.trade_count:,} trades"
         )
 
     keyboard = traders_keyboard(page, total_pages)
@@ -509,6 +507,32 @@ async def cmd_signal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
 
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_discover(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handle /discover. Forces a fresh trader discovery run.
+    """
+    if not _is_admin(update):
+        return
+    await update.message.reply_text("🔍 Starting fresh trader discovery across all categories...\nThis takes a few minutes. I'll log progress.")
+    try:
+        from core.discovery import discover_top_traders
+        await discover_top_traders()
+        async with get_session() as session:
+            trader_repo = TraderRepo(session)
+            active = await trader_repo.get_active()
+            all_traders = await trader_repo.get_all()
+        watching = len(all_traders) - len(active)
+        await update.message.reply_text(
+            f"✅ Discovery complete!\n"
+            f"🟢 <b>{len(active)}</b> traders actively monitored\n"
+            f"🟡 <b>{watching}</b> traders in watching pool",
+            parse_mode="HTML",
+        )
+    except Exception as exc:
+        logger.error("Discovery failed: %s", exc)
+        await update.message.reply_text(f"❌ Discovery failed: {exc}")
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

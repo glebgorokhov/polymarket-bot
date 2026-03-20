@@ -269,7 +269,7 @@ async def _score_candidate(address: str, entry: dict) -> Optional[tuple[float, d
     try:
         async with DataApiClient() as data_client:
             # Fetch up to 500 trades for a proper history
-            trades = await data_client.get_trades(user=address, limit=500)
+            trades = await data_client.get_all_trades(user=address)
 
         if len(trades) < _MIN_TRADES:
             return None
@@ -430,7 +430,7 @@ async def refresh_tracked_traders() -> None:
     async def rescore(trader: Trader) -> None:
         try:
             async with DataApiClient() as data_client:
-                trades = await data_client.get_trades(user=trader.address, limit=500)
+                trades = await data_client.get_all_trades(user=trader.address)
             if len(trades) < _MIN_TRADES:
                 updated.append((trader, 0.0))
                 return
