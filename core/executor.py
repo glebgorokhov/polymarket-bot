@@ -28,6 +28,9 @@ def _get_clob_client() -> ClobApiClient:
         relayer_api_key=cfg.relayer_api_key,
         relayer_api_address=cfg.relayer_api_address,
         signer_address=cfg.signer_address,
+        relayer_api_secret=cfg.relayer_api_secret,
+        relayer_api_passphrase=cfg.relayer_api_passphrase,
+        funder_address=cfg.funder_address,
     )
 
 

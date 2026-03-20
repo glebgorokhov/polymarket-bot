@@ -174,6 +174,9 @@ async def poll_all_traders() -> None:
         relayer_api_key=settings_cfg.relayer_api_key,
         relayer_api_address=settings_cfg.relayer_api_address,
         signer_address=settings_cfg.signer_address,
+        relayer_api_secret=settings_cfg.relayer_api_secret,
+        relayer_api_passphrase=settings_cfg.relayer_api_passphrase,
+        funder_address=settings_cfg.funder_address,
     )
 
     async with DataApiClient() as data_client, GammaApiClient() as gamma_client:

@@ -34,6 +34,9 @@ class ClobApiClient:
         relayer_api_key: str,
         relayer_api_address: str,
         signer_address: str,
+        relayer_api_secret: str = "",
+        relayer_api_passphrase: str = "",
+        funder_address: str = "",
         host: str = "https://clob.polymarket.com",
         chain_id: int = 137,
     ) -> None:
@@ -48,8 +51,13 @@ class ClobApiClient:
             chain_id: EVM chain ID (137 = Polygon mainnet).
         """
         self._relayer_api_key = relayer_api_key
+        self._relayer_api_secret = relayer_api_secret
+        self._relayer_api_passphrase = relayer_api_passphrase
         self._relayer_api_address = relayer_api_address
         self._signer_address = signer_address
+        # funder_address = the account wallet that holds USDC (may differ from signer)
+        # e.g. signer = 0x807b6... (relayer), funder = 0xc570... (Gleb's account)
+        self._funder_address = funder_address or relayer_api_address
         self._host = host
         self._chain_id = chain_id
         self._client = None
@@ -63,8 +71,8 @@ class ClobApiClient:
 
                 creds = ApiCreds(
                     api_key=self._relayer_api_key,
-                    api_secret="",
-                    api_passphrase="",
+                    api_secret=self._relayer_api_secret,
+                    api_passphrase=self._relayer_api_passphrase,
                 )
                 self._client = ClobClient(
                     host=self._host,
@@ -72,7 +80,7 @@ class ClobApiClient:
                     key=self._signer_address,
                     creds=creds,
                     signature_type=1,
-                    funder=self._relayer_api_address,
+                    funder=self._funder_address,
                 )
             except ImportError as exc:
                 raise RuntimeError(
