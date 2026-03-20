@@ -117,8 +117,9 @@ async def check(conn, check_num: int, start_time: datetime) -> str:
     # 5. Recent trades placed (last 22 min)
     recent_trades = await conn.fetch("""
         SELECT p.market_name, p.side, p.entry_price, p.size_usd, p.is_shadow,
-               t.display_name
-        FROM positions p JOIN traders t ON p.trader_id = t.id
+               s.trader_id
+        FROM positions p
+        LEFT JOIN signals s ON p.signal_id = s.id
         WHERE p.opened_at >= $1
         ORDER BY p.opened_at DESC LIMIT 5
     """, since)
@@ -126,8 +127,8 @@ async def check(conn, check_num: int, start_time: datetime) -> str:
         lines.append(f"\n<b>New trades (last 20min):</b>")
         for tr in recent_trades:
             kind = "👻" if tr['is_shadow'] else "💸"
-            name = tr['display_name'] or "?"
-            lines.append(f"  {kind} {name}: {tr['side']} @ {tr['entry_price']:.3f} ${tr['size_usd']:.2f}")
+            mkt = (tr['market_name'] or "?")[:40]
+            lines.append(f"  {kind} {tr['side']} @ {tr['entry_price']:.3f} ${tr['size_usd']:.2f} — {mkt}")
 
     # 6. Warnings
     warnings = []

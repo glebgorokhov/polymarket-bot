@@ -61,13 +61,25 @@ async def execute_copy_trade(signal: Signal, mode: str) -> None:
         settings = await settings_repo.as_dict()
         primary_slug = await settings_repo.get("active_strategy_slug", "consensus")
 
-    # Get balance
+    # Get balance — fall back to DB budget_total when CLOB returns 0 (e.g. drained
+    # wallet, funds in transit, or CLOB lag) so strategy evaluation still runs.
+    # Actual order placement will validate real balance separately.
     clob_client = _get_clob_client()
     try:
-        balance = await clob_client.get_balance()
+        clob_balance = await clob_client.get_balance()
     except Exception as exc:
         logger.error("Failed to get balance: %s", exc)
-        balance = float(settings.get("budget_total", cfg.default_budget_total))
+        clob_balance = 0.0
+
+    if clob_balance < 1.0:
+        db_budget = float(settings.get("budget_total", cfg.default_budget_total))
+        logger.warning(
+            "CLOB balance $%.2f < $1 — using DB budget_total $%.2f for strategy evaluation",
+            clob_balance, db_budget,
+        )
+        balance = db_budget
+    else:
+        balance = clob_balance
 
     per_trade_pct = float(settings.get("budget_per_trade_pct", cfg.default_per_trade_pct))
     max_trade_usd = float(settings.get("max_trade_usd", cfg.default_max_trade_usd))
