@@ -61,28 +61,22 @@ async def validate_signal(
     if not market_id:
         return False, "missing_market_id"
 
-    # 1. Check market active + end date via Gamma
+    # 1. Check market is not closed via CLOB (authoritative source)
+    # We use CLOB closed flag — NOT Gamma endDate, which is often stale.
+    # Many markets have endDate in the past but are still accepting orders (closed=False).
     try:
-        market = await gamma_client.get_market(condition_id=market_id)
-        if not market:
-            return False, "market_not_found"
-        if not market.get("active", False):
-            return False, "market_not_active"
-
-        # 2. Check not resolving soon
-        end_date_str = market.get("endDate", market.get("end_date_iso", ""))
-        if end_date_str:
-            end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
-            now = datetime.now(timezone.utc)
-            hours_remaining = (end_date - now).total_seconds() / 3600
-            if hours_remaining < 0:
+        import httpx as _httpx
+        _r = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: _httpx.get(
+                f"https://clob.polymarket.com/markets/{market_id}", timeout=8
+            )
+        )
+        if _r.status_code == 200:
+            _m = _r.json()
+            if _m.get("closed", False):
                 return False, "market_already_resolved"
-            # Note: _RESOLVE_SOON_HOURS=0 means we don't skip based on time.
-            # Intraday traders (our main pool) trade 15-min markets — filtering
-            # by time would kill all their signals.
     except Exception as exc:
-        logger.warning("Failed to validate market %s: %s", market_id, exc)
-        return False, f"market_check_error: {exc}"
+        logger.warning("Failed to check market closed status %s: %s", market_id, exc)
 
     # 3. Check spread
     try:
