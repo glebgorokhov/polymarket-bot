@@ -641,8 +641,9 @@ async def cmd_feed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         # Only show markets with actual activity worth noting
         unique_traders = len({t["trader_address"] for t in trades})
 
-        # Market name + link
-        market_title = trades[0].get("market_title") or condition_id[:20]
+        # Market name + link (escape HTML entities in dynamic content)
+        import html as _html
+        market_title = _html.escape(trades[0].get("market_title") or condition_id[:20])
         market_url = trades[0].get("market_url") or ""
         if market_url:
             market_display = f'<a href="{market_url}">{market_title[:55]}</a>'
@@ -661,9 +662,11 @@ async def cmd_feed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         for t in sorted(trades, key=lambda x: x["usd_value"], reverse=True)[:5]:
             side_icon = "🔵" if t["side"] == "BUY" else "🔴"
-            outcome_str = f" [{t['outcome']}]" if t.get("outcome") and t["outcome"] != "?" else ""
+            safe_name = _html.escape(t["trader_name"])
+            safe_outcome = _html.escape(t.get("outcome") or "")
+            outcome_str = f" [{safe_outcome}]" if safe_outcome and safe_outcome != "?" else ""
             lines.append(
-                f"  {side_icon} <b>{t['trader_name']}</b>{outcome_str} — {t['side']} @ {t['price']:.2f} · ${t['usd_value']:.0f}"
+                f"  {side_icon} <b>{safe_name}</b>{outcome_str} — {t['side']} @ {t['price']:.2f} · ${t['usd_value']:.0f}"
             )
         lines.append("")
         shown += 1
