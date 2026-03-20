@@ -83,9 +83,9 @@ class DataApiClient:
 
     async def get_leaderboard(
         self,
-        category: str = "ALL",
+        category: str = "OVERALL",
         time_period: str = "ALL",
-        order_by: str = "profit",
+        order_by: str = "PNL",
         limit: int = 50,
         offset: int = 0,
     ) -> list[dict]:
@@ -93,11 +93,11 @@ class DataApiClient:
         Fetch the Polymarket leaderboard.
 
         Args:
-            category: Market category filter (ALL, POLITICS, SPORTS, etc.)
-            time_period: Time window (ALL, month, week, day)
-            order_by: Sort field (profit, volume, etc.)
-            limit: Maximum results to return.
-            offset: Pagination offset.
+            category: Market category filter (OVERALL, POLITICS, SPORTS, CRYPTO, etc.)
+            time_period: Time window (ALL, MONTH, WEEK, DAY)
+            order_by: Sort field (PNL, VOL)
+            limit: Maximum results to return (max 50).
+            offset: Pagination offset (max 1000).
 
         Returns:
             List of leaderboard entry dicts.

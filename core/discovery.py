@@ -212,6 +212,9 @@ async def _build_monthly_pnl_history(trades: list[dict]) -> list[dict]:
     """
     Aggregate trades into monthly PnL records.
 
+    Uses buy/sell to estimate PnL: buys are negative cash flow, sells positive.
+    This is a rough approximation — real PnL needs resolved market data.
+
     Args:
         trades: Raw trade dicts from Data API.
 
@@ -220,14 +223,22 @@ async def _build_monthly_pnl_history(trades: list[dict]) -> list[dict]:
     """
     monthly: dict[str, float] = {}
     for trade in trades:
-        ts_str = trade.get("timestamp", trade.get("createdAt", ""))
-        if not ts_str:
+        ts_raw = trade.get("timestamp")
+        if not ts_raw:
             continue
         try:
-            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            # Timestamp can be Unix int or ISO string
+            if isinstance(ts_raw, (int, float)):
+                ts = datetime.fromtimestamp(ts_raw, tz=timezone.utc)
+            else:
+                ts = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00"))
             key = ts.strftime("%Y-%m")
-            pnl = float(trade.get("profit", trade.get("pnl", 0)) or 0)
-            monthly[key] = monthly.get(key, 0.0) + pnl
+            size = float(trade.get("size", 0) or 0)
+            price = float(trade.get("price", 0) or 0)
+            side = trade.get("side", "").upper()
+            # Rough PnL: sells add cash, buys subtract
+            cash_flow = size * price if side == "SELL" else -(size * price)
+            monthly[key] = monthly.get(key, 0.0) + cash_flow
         except (ValueError, TypeError):
             continue
 
@@ -247,10 +258,10 @@ async def discover_top_traders() -> None:
 
     async with DataApiClient() as data_client:
         leaderboard = await data_client.get_leaderboard(
-            category="ALL",
+            category="OVERALL",
             time_period="ALL",
-            order_by="profit",
-            limit=_LEADERBOARD_LIMIT,
+            order_by="PNL",
+            limit=50,
         )
 
     if not leaderboard:
@@ -271,9 +282,12 @@ async def discover_top_traders() -> None:
 
             last_trade_ts: Optional[datetime] = None
             if trades:
-                ts_str = trades[0].get("timestamp", trades[0].get("createdAt", ""))
-                if ts_str:
-                    last_trade_ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                ts_raw = trades[0].get("timestamp")
+                if ts_raw:
+                    if isinstance(ts_raw, (int, float)):
+                        last_trade_ts = datetime.fromtimestamp(ts_raw, tz=timezone.utc)
+                    else:
+                        last_trade_ts = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00"))
 
             score = compute_composite_score(
                 monthly_pnl_history=monthly_history,
@@ -285,10 +299,10 @@ async def discover_top_traders() -> None:
                 score,
                 {
                     "address": address,
-                    "display_name": entry.get("name", entry.get("username", "")),
+                    "display_name": entry.get("userName", entry.get("name", "")),
                     "score": score,
                     "category_strengths": category_strengths,
-                    "total_pnl": float(entry.get("profit", entry.get("pnl", 0)) or 0),
+                    "total_pnl": float(entry.get("pnl", entry.get("profit", 0)) or 0),
                     "monthly_pnl_history": monthly_history,
                     "trade_count": len(trades),
                     "last_active_at": last_trade_ts,
@@ -365,9 +379,12 @@ async def refresh_tracked_traders() -> None:
 
             last_trade_ts: Optional[datetime] = None
             if trades:
-                ts_str = trades[0].get("timestamp", trades[0].get("createdAt", ""))
-                if ts_str:
-                    last_trade_ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                ts_raw = trades[0].get("timestamp")
+                if ts_raw:
+                    if isinstance(ts_raw, (int, float)):
+                        last_trade_ts = datetime.fromtimestamp(ts_raw, tz=timezone.utc)
+                    else:
+                        last_trade_ts = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00"))
 
             score = compute_composite_score(
                 monthly_pnl_history=monthly_history,
