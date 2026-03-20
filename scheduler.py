@@ -161,7 +161,7 @@ def start_scheduler() -> AsyncIOScheduler:
     scheduler = get_scheduler()
 
     from core import monitor, executor
-    from core.discovery import refresh_tracked_traders, discover_top_traders
+    from core.discovery import refresh_trader_scores, discover_top_traders
 
     # Poll traders every 30 seconds
     scheduler.add_job(
@@ -205,7 +205,7 @@ def start_scheduler() -> AsyncIOScheduler:
 
     # Daily trader refresh at 02:00 UTC
     scheduler.add_job(
-        refresh_tracked_traders,
+        refresh_trader_scores,
         trigger=CronTrigger(hour=2, minute=0, timezone="UTC"),
         id="refresh_traders",
         name="Refresh tracked trader scores",
