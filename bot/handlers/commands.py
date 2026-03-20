@@ -77,6 +77,7 @@ async def _build_status_text() -> str:
     # Get balance from CLOB — requires py-clob-client auth
     balance = None
     balance_source = "live"
+    clob_error: str = ""
     try:
         from api.clob import ClobApiClient
         clob = ClobApiClient(
@@ -89,7 +90,8 @@ async def _build_status_text() -> str:
         raw_balance = await clob.get_balance()
         balance = float(raw_balance or 0)
     except Exception as exc:
-        logger.warning("CLOB balance fetch failed: %s", exc)
+        clob_error = str(exc)
+        logger.warning("CLOB balance fetch failed: %s", exc, exc_info=True)
         balance = None
         balance_source = "unavailable"
 
@@ -112,7 +114,8 @@ async def _build_status_text() -> str:
     if balance is not None:
         bal_str = f"${balance:.2f} (live)"
     else:
-        bal_str = "⚠️ unavailable (CLOB auth failed)"
+        short_err = clob_error[:80] if clob_error else "unknown"
+        bal_str = f"⚠️ unavailable\n<code>{short_err}</code>"
 
     return (
         f"📊 <b>Status</b>\n\n"
