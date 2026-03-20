@@ -677,12 +677,31 @@ async def cmd_feed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not shown:
         lines.append("No notable activity in the last 5 trades per trader.")
 
-    # Telegram message limit is 4096 chars — truncate if needed
-    text = "\n".join(lines)
-    if len(text) > 3900:
-        text = text[:3900] + "\n…"
+    # Split into chunks at market boundaries (blank lines) so we never cut mid-tag.
+    # Telegram limit is 4096 *bytes* (not chars); emojis = 4 bytes each.
+    MAX_BYTES = 3800
+    chunks: list[str] = []
+    current_lines: list[str] = []
+    current_bytes = 0
 
-    await update.message.reply_text(text, parse_mode="HTML")
+    for line in lines:
+        line_bytes = len(line.encode("utf-8")) + 1  # +1 for \n
+        if current_bytes + line_bytes > MAX_BYTES and current_lines:
+            chunks.append("\n".join(current_lines))
+            current_lines = [line]
+            current_bytes = line_bytes
+        else:
+            current_lines.append(line)
+            current_bytes += line_bytes
+
+    if current_lines:
+        chunks.append("\n".join(current_lines))
+
+    for i, chunk in enumerate(chunks):
+        if i == 0:
+            await update.message.reply_text(chunk, parse_mode="HTML")
+        else:
+            await update.message.reply_text(chunk, parse_mode="HTML")
 
 
 async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
