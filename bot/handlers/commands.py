@@ -889,6 +889,10 @@ async def cmd_simulate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     cfg = get_settings()
     budget = float(cfg.per_trade_budget or 50.0) if hasattr(cfg, "per_trade_budget") else 50.0
 
+    # Parse optional limit arg: /simulate 20 → top 20 by score
+    args = context.args or []
+    limit = int(args[0]) if args and args[0].isdigit() else 50
+
     await update.message.reply_text(
         f"🔬 Running backtest on top {limit} traders by score...\n"
         f"Fetching trade history + checking market resolutions. May take a few minutes.\n"
@@ -902,10 +906,6 @@ async def cmd_simulate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         async with get_session() as session:
             all_traders = list(await TraderRepo(session).get_all())
-
-        # Parse optional limit arg: /simulate 20 → top 20 by score
-        args = context.args or []
-        limit = int(args[0]) if args and args[0].isdigit() else 50
 
         # Only simulate active + watching with known PnL, top N by score
         candidates = sorted(
