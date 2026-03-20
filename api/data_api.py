@@ -211,10 +211,11 @@ class DataApiClient:
     async def get_all_traders_in_market(self, condition_id: str) -> set[str]:
         """
         Get all unique trader addresses that participated in a market.
-        Market-level endpoint has no offset cap (unlike user-level which caps at 3000).
+        Caps at offset 3000 — same hard limit as user-level trade endpoint.
         """
         traders: set[str] = set()
         offset = 0
+        _MAX_OFFSET = 3000
         while True:
             batch = await self.get_trades_by_market(condition_id, limit=500, offset=offset)
             if not batch:
@@ -226,6 +227,8 @@ class DataApiClient:
             if len(batch) < 500:
                 break
             offset += 500
+            if offset >= _MAX_OFFSET:
+                break
             await asyncio.sleep(0.05)
         return traders
 
