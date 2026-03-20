@@ -279,11 +279,15 @@ def _format_trader_card(trader) -> str:
     pin_str = "  📌" if getattr(trader, "is_pinned", False) else ""
     pnl_str = f"+${trader.total_pnl:,.0f}" if trader.total_pnl >= 0 else f"-${abs(trader.total_pnl):,.0f}"
 
+    # Win rate quality indicator
+    wr_val = trader.win_rate or 0
+    wr_icon = "🔥" if wr_val >= 0.65 else ("✅" if wr_val >= 0.55 else ("⚠️" if wr_val >= 0.45 else "❌"))
+
     return (
         f"{status_icon} <b><a href=\"{profile_url}\">{name}</a></b>{rank_str}{pin_str}\n"
-        f"💰 {pnl_str} total  ·  Score: <b>{trader.score:.3f}</b>\n"
+        f"💰 {pnl_str}  ·  Score: <b>{trader.score:.3f}</b>\n"
         f"📊 {trader.trade_count:,} trades · {trades_per_week} · last active {last_active}\n"
-        f"🏆 Win rate: {win_rate} · Consistency: {consistency} · Avg: {profit_str}\n"
+        f"{wr_icon} Win rate: {win_rate} · Consistency: {consistency} · Avg: {profit_str}\n"
         f"{heatmap}"
     )
 

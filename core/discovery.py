@@ -147,24 +147,30 @@ def compute_composite_score(
     monthly_pnl_history: list[dict],
     trade_count: int,
     last_active_at: Optional[datetime],
+    weekly_pnl_history: Optional[list] = None,
 ) -> float:
     """
-    Composite trader quality score, heavily weighted toward consistency.
+    Composite trader quality score. Primary metric: weekly win rate.
 
     Formula:
-        base = (consistency * 0.60)   ← dominant factor
-             + (sharpe * 0.25)
-             + (diversity * 0.15)
-             + streak_bonus (up to 0.20)
-        score = base × recency_multiplier   ← recency kills inactive traders
+        base = win_rate_weekly * 0.55     ← dominant: % of weeks profitable
+             + recent_form * 0.30         ← last 8 weeks: how many green
+             + diversity * 0.15           ← trades across many markets/months
+             + streak_bonus (up to 0.15)  ← recent consecutive green weeks
+        score = base × recency_multiplier ← kills score for inactive traders
         capped at 1.0
 
-    Recency is a MULTIPLIER, not additive. A trader inactive >60 days scores 0.
+    Hard gates (before scoring):
+    - <30 trades total
+    - <3 months of history
+    - inactive >60 days (recency_mult = 0.0)
+    - weekly win rate <40% → score 0 (not worth tracking)
 
     Args:
         monthly_pnl_history: List of {month: "YYYY-MM", pnl: float} dicts.
         trade_count: Total lifetime trade count.
         last_active_at: Timestamp of last trade.
+        weekly_pnl_history: Optional list of {week, pnl} dicts for better win rate calc.
 
     Returns:
         Composite score in [0, 1].
@@ -175,31 +181,55 @@ def compute_composite_score(
     if len(monthly_pnl_history) < _MIN_MONTHS_ACTIVE:
         return 0.0
 
-    # Recency multiplier — kills score for dormant traders before computing anything else
     recency_mult = _compute_recency_multiplier(last_active_at)
     if recency_mult == 0.0:
-        return 0.0  # Don't bother computing — they're dormant
+        return 0.0
 
+    # Weekly win rate — fraction of weeks with positive PnL
+    weekly = weekly_pnl_history or []
+    if weekly:
+        profitable_weeks = sum(1 for w in weekly if w.get("pnl", 0) > 2)
+        win_rate = profitable_weeks / len(weekly)
+    else:
+        # Fallback to monthly consistency if no weekly data
+        profitable_months = sum(1 for m in monthly_pnl_history[-6:] if m.get("pnl", 0) > 0)
+        win_rate = profitable_months / max(len(monthly_pnl_history[-6:]), 1)
+
+    # Hard gate: <40% win rate = not worth tracking
+    if win_rate < 0.40:
+        return 0.0
+
+    # Recent form: last 8 weeks
+    recent_8 = weekly[-8:] if len(weekly) >= 4 else []
+    if recent_8:
+        recent_form = sum(1 for w in recent_8 if w.get("pnl", 0) > 2) / len(recent_8)
+    else:
+        recent_form = win_rate  # Fallback
+
+    # Diversity: active months × trades per month
     months_active = len([m for m in monthly_pnl_history if m.get("pnl", 0) != 0])
     trades_per_month = trade_count / max(months_active, 1)
+    diversity = min(trades_per_month / 20.0, 1.0)  # 20+ trades/month = max diversity
 
-    consistency = _compute_consistency_score(monthly_pnl_history)
-    sharpe_norm = _compute_sharpe_normalized(monthly_pnl_history)
-    diversity = _compute_diversity_score(monthly_pnl_history, trade_count)
-    frequency = _compute_frequency_score(trades_per_month)
-    streak_bonus = _compute_winning_streak_bonus(monthly_pnl_history)
+    # Streak bonus: consecutive green weeks at the end
+    streak = 0
+    for w in reversed(weekly[-8:]):
+        if w.get("pnl", 0) > 2:
+            streak += 1
+        else:
+            break
+    streak_bonus = min(streak * 0.025, 0.15)
 
     base_score = (
-        consistency * 0.60
-        + sharpe_norm * 0.25
+        win_rate * 0.55
+        + recent_form * 0.30
         + diversity * 0.15
     )
-    # Recency is a multiplier — dormant traders get crushed
     score = min((base_score + streak_bonus) * recency_mult, 1.0)
 
     logger.debug(
-        "Score: consistency=%.2f sharpe=%.2f diversity=%.2f freq=%.2f streak=%.2f recency_mult=%.2f → %.3f",
-        consistency, sharpe_norm, diversity, frequency, streak_bonus, recency_mult, score,
+        "Score: win_rate=%.2f recent_form=%.2f diversity=%.2f streak=%.2f recency_mult=%.2f → %.3f",
+        win_rate, recent_form, diversity, streak_bonus, recency_mult, score,
     )
     return round(score, 4)
 
@@ -379,6 +409,7 @@ async def _score_candidate(address: str, entry: dict) -> Optional[tuple[float, d
                 monthly_pnl_history=monthly_history,
                 trade_count=len(trades),
                 last_active_at=last_trade_ts,
+                weekly_pnl_history=weekly_history,
             )
 
         return (score, {
@@ -548,6 +579,7 @@ async def refresh_tracked_traders() -> None:
                 monthly_pnl_history=monthly_history,
                 trade_count=len(trades),
                 last_active_at=last_trade_ts,
+                weekly_pnl_history=weekly_history,
             )
             updated.append((trader, score))
         except Exception as exc:
