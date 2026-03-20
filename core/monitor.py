@@ -140,7 +140,9 @@ async def poll_trader(
 
     new_trades = []
     for trade in trades:
-        trade_id = str(trade.get("id", trade.get("transactionHash", "")))
+        # id field exists but is None — must use 'or' not dict.get default
+        raw_id = trade.get("transactionHash") or trade.get("id") or trade.get("timestamp")
+        trade_id = str(raw_id) if raw_id is not None else ""
         if trade_id == last_trade_id:
             break
         new_trades.append(trade)
@@ -200,11 +202,10 @@ async def poll_all_traders() -> None:
                 trader.address,
             )
 
-            # Update last seen ID
+            # Update last seen ID — transactionHash is reliable; id field is null in API
             first_trade = new_trades[0]
-            _last_trade_ids[trader.id] = str(
-                first_trade.get("id", first_trade.get("transactionHash", ""))
-            )
+            raw_id = first_trade.get("transactionHash") or first_trade.get("id") or first_trade.get("timestamp")
+            _last_trade_ids[trader.id] = str(raw_id) if raw_id is not None else ""
 
             # On first poll (last_id was None): just set the watermark, don't process.
             # This avoids flooding notifications with stale trades from before bot start.
