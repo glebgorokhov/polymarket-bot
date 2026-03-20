@@ -239,67 +239,56 @@ async def cmd_maxtrade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 def _format_trader_card(trader) -> str:
-    """Format a rich trader card with heatmap and stats."""
+    """Format trader card using ground-truth leaderboard metrics."""
     name = trader.display_name or trader.address[:14] + "…"
     profile_url = f"https://polymarket.com/profile/{trader.address}"
     status_icon = {"active": "🟢", "watching": "🟡", "inactive": "🔴"}.get(trader.status, "⚪")
 
-    # 30-week heatmap: 🟩 profitable, 🟥 losing, ⬜ no activity
-    weekly = trader.weekly_pnl_history or []
-    recent_30 = weekly[-30:] if len(weekly) >= 30 else weekly
-    squares = []
-    for w in recent_30:
-        pnl = w.get("pnl", 0)
-        if pnl > 2:
-            squares.append("🟩")
-        elif pnl < -2:
-            squares.append("🟥")
+    rank_str = f"  🏅 #{trader.leaderboard_rank}" if trader.leaderboard_rank and trader.leaderboard_rank < 500 else ""
+    pin_str = "  📌" if getattr(trader, "is_pinned", False) else ""
+    pnl_str = f"+${trader.total_pnl:,.0f}" if (trader.total_pnl or 0) >= 0 else f"-${abs(trader.total_pnl or 0):,.0f}"
+
+    # Capital efficiency: PnL / Volume
+    efficiency = None
+    extra = trader.category_strengths or {}  # reused as generic extra stats
+    if trader.total_pnl and extra.get("avg_bet_pct"):
+        # Stored in extra_stats by new scoring
+        avg_bet_pct_str = f"~{extra['avg_bet_pct']:.1f}% per bet"
+    elif trader.avg_profit_per_trade:
+        avg_bet_pct_str = f"${trader.avg_profit_per_trade:+.0f}/position"
+    else:
+        avg_bet_pct_str = "—"
+
+    # Active duration
+    active_days = extra.get("active_days")
+    if active_days:
+        if active_days >= 365:
+            duration_str = f"{active_days // 30}mo"
+        elif active_days >= 30:
+            duration_str = f"{active_days // 7}wk"
         else:
-            squares.append("⬜️")
-    # Pad with grey on the left if fewer than 30 weeks
-    while len(squares) < 30:
-        squares.insert(0, "⬜️")
-    heatmap = "".join(squares)
-
-    # Consistency: profitable months in last 6
-    monthly = trader.monthly_pnl_history or []
-    profitable_m = sum(1 for m in monthly[-6:] if m.get("pnl", 0) > 0)
-    total_m = min(len(monthly), 6)
-    consistency = f"{profitable_m}/{total_m}mo" if total_m >= 2 else "new"
-
-    # Stats
-    win_rate = f"{trader.win_rate * 100:.0f}%" if trader.win_rate is not None else "—"
-    trades_per_week = f"{trader.avg_trades_per_week:.1f}/wk" if trader.avg_trades_per_week is not None else "—"
-    avg_profit = trader.avg_profit_per_trade
-    profit_str = (
-        f"{'+' if avg_profit >= 0 else ''}${avg_profit:.2f}/trade"
-        if avg_profit is not None else "—"
-    )
+            duration_str = f"{active_days}d"
+    else:
+        duration_str = "—"
 
     # Last active
     if trader.last_active_at:
         from datetime import timezone as tz
-        days_ago = (datetime.now(tz.utc) - trader.last_active_at.replace(tzinfo=tz.utc)
-                    if trader.last_active_at.tzinfo is None
-                    else datetime.now(tz.utc) - trader.last_active_at).days
-        last_active = f"{days_ago}d ago" if days_ago > 0 else "today"
+        last_dt = trader.last_active_at
+        if last_dt.tzinfo is None:
+            last_dt = last_dt.replace(tzinfo=tz.utc)
+        days_ago = (datetime.now(tz.utc) - last_dt).days
+        last_active = "today" if days_ago == 0 else f"{days_ago}d ago"
     else:
         last_active = "—"
 
-    rank_str = f"  🏅 #{trader.leaderboard_rank}" if trader.leaderboard_rank and trader.leaderboard_rank < 500 else ""
-    pin_str = "  📌" if getattr(trader, "is_pinned", False) else ""
-    pnl_str = f"+${trader.total_pnl:,.0f}" if trader.total_pnl >= 0 else f"-${abs(trader.total_pnl):,.0f}"
-
-    # Win rate quality indicator
-    wr_val = trader.win_rate or 0
-    wr_icon = "🔥" if wr_val >= 0.65 else ("✅" if wr_val >= 0.55 else ("⚠️" if wr_val >= 0.45 else "❌"))
+    trades_per_week = f"{trader.avg_trades_per_week:.0f}/wk" if trader.avg_trades_per_week else "—"
 
     return (
         f"{status_icon} <b><a href=\"{profile_url}\">{name}</a></b>{rank_str}{pin_str}\n"
         f"💰 {pnl_str}  ·  Score: <b>{trader.score:.3f}</b>\n"
-        f"📊 {trader.trade_count:,} trades · {trades_per_week} · last active {last_active}\n"
-        f"{wr_icon} Win rate: {win_rate} · Consistency: {consistency} · Avg: {profit_str}\n"
-        f"{heatmap}"
+        f"📊 {trader.trade_count:,} positions · {trades_per_week} · {duration_str} active\n"
+        f"⚡ {avg_bet_pct_str}  ·  last active {last_active}"
     )
 
 
@@ -322,8 +311,8 @@ async def _send_traders_page(update: Update, page: int) -> None:
         await update.message.reply_text("No traders tracked yet. Discovery may still be running.")
         return
 
-    active = sorted([t for t in traders if t.status == "active"], key=lambda t: (-(t.score or 0), -(t.win_rate or 0)))
-    watching = sorted([t for t in traders if t.status == "watching"], key=lambda t: (-(t.score or 0), -(t.win_rate or 0)))
+    active = sorted([t for t in traders if t.status == "active"], key=lambda t: -(t.score or 0))
+    watching = sorted([t for t in traders if t.status == "watching"], key=lambda t: -(t.score or 0))
     inactive = sorted([t for t in traders if t.status == "inactive"], key=lambda t: -(t.score or 0))
 
     # Active first, then watching, then inactive — each group sorted by score+win_rate
