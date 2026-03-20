@@ -29,7 +29,9 @@ _SCORE_THRESHOLD = 0.25         # Minimum score to stay in DB at all
 _MIN_TRADES = 30                # Require at least 30 total trades
 _MIN_MONTHS_ACTIVE = 3          # Require at least 3 months of history
 # No hard cap on active traders — everyone above _ACTIVE_SCORE_THRESHOLD gets polled.
-# In practice, expect 100-300 qualifying traders. Even 500 × 1 poll/30s = 16 req/sec, fine.
+# VIP bypass: top leaderboard traders with high PnL+volume skip consistency gates.
+_VIP_MIN_PNL = 10_000.0         # Leaderboard PnL (USD) threshold for VIP bypass
+_VIP_MIN_VOLUME = 100_000.0     # Leaderboard volume (USD) threshold for VIP bypass
 
 # All Polymarket categories to pull from
 _CATEGORIES = [
@@ -315,35 +317,54 @@ async def _fetch_all_leaderboard_candidates() -> dict[str, dict]:
 async def _score_candidate(address: str, entry: dict) -> Optional[tuple[float, dict]]:
     """
     Fetch trade history for a candidate and compute their composite score.
+
+    VIP bypass: traders with leaderboard PnL > $10k AND volume > $100k skip
+    the consistency gates and get a base score of 0.5. They're proven in aggregate.
+
     Returns None if they fail hard gates (too few trades, not enough history).
     """
+    leaderboard_pnl = float(entry.get("pnl", 0) or 0)
+    leaderboard_vol = float(entry.get("vol", 0) or 0)
+    leaderboard_rank = int(entry.get("rank", 9999) or 9999)
+    is_vip = leaderboard_pnl >= _VIP_MIN_PNL and leaderboard_vol >= _VIP_MIN_VOLUME
+
     try:
         async with DataApiClient() as data_client:
-            # Fetch up to 500 trades for a proper history
             trades = await data_client.get_all_trades(user=address)
 
-        if len(trades) < _MIN_TRADES:
+        if len(trades) < 5:  # Absolute minimum — at least some history
             return None
 
         monthly_history = await _build_monthly_pnl_history(trades)
-        if len(monthly_history) < _MIN_MONTHS_ACTIVE:
-            return None
-
         weekly_history = await _build_weekly_pnl_history(trades)
         extra_stats = _compute_extra_stats(trades, weekly_history)
         last_trade_ts = _parse_trade_ts(trades[0]) if trades else None
 
-        score = compute_composite_score(
-            monthly_pnl_history=monthly_history,
-            trade_count=len(trades),
-            last_active_at=last_trade_ts,
-        )
+        # Hard gates — bypassed for VIP traders
+        if not is_vip:
+            if len(trades) < _MIN_TRADES:
+                return None
+            if len(monthly_history) < _MIN_MONTHS_ACTIVE:
+                return None
+
+        if is_vip and len(monthly_history) < _MIN_MONTHS_ACTIVE:
+            # VIP with short history: give base score from rank
+            score = max(0.5, 1.0 - (leaderboard_rank / 100))
+            logger.info("VIP bypass for %s (rank=%d, PnL=$%.0f, vol=$%.0f) score=%.3f",
+                        address[:16], leaderboard_rank, leaderboard_pnl, leaderboard_vol, score)
+        else:
+            score = compute_composite_score(
+                monthly_pnl_history=monthly_history,
+                trade_count=len(trades),
+                last_active_at=last_trade_ts,
+            )
 
         return (score, {
             "address": address,
             "display_name": entry.get("userName", entry.get("name", "")),
             "score": score,
-            "total_pnl": float(entry.get("pnl", 0) or 0),
+            "total_pnl": leaderboard_pnl,
+            "leaderboard_rank": leaderboard_rank,
             "monthly_pnl_history": monthly_history,
             "weekly_pnl_history": weekly_history,
             "trade_count": len(trades),
@@ -416,8 +437,11 @@ async def discover_top_traders() -> None:
         existing = await trader_repo.get_all()
         for t in existing:
             if t.address not in top_watching_addresses and t.status != "inactive":
-                logger.info("Downgrading trader %s to inactive (dropped from ranking)", t.address)
-                await trader_repo.update_status(t.id, "inactive")
+                if t.is_pinned:
+                    logger.info("Skipping downgrade of pinned trader %s", t.address)
+                else:
+                    logger.info("Downgrading trader %s to inactive (dropped from ranking)", t.address)
+                    await trader_repo.update_status(t.id, "inactive")
 
         # Upsert all top traders
         for score, data in top_watching:
@@ -429,6 +453,7 @@ async def discover_top_traders() -> None:
                 status=new_status,
                 category_strengths=None,
                 total_pnl=data.get("total_pnl", 0.0),
+                leaderboard_rank=data.get("leaderboard_rank"),
                 monthly_pnl_history=data.get("monthly_pnl_history"),
                 weekly_pnl_history=data.get("weekly_pnl_history"),
                 trade_count=data.get("trade_count", 0),

@@ -57,6 +57,7 @@ class TraderRepo:
         win_rate: Optional[float] = None,
         avg_trades_per_week: Optional[float] = None,
         avg_profit_per_trade: Optional[float] = None,
+        leaderboard_rank: Optional[int] = None,
         first_seen_at: Optional[datetime] = None,
         last_active_at: Optional[datetime] = None,
     ) -> Trader:
@@ -76,6 +77,7 @@ class TraderRepo:
                 win_rate=win_rate,
                 avg_trades_per_week=avg_trades_per_week,
                 avg_profit_per_trade=avg_profit_per_trade,
+                leaderboard_rank=leaderboard_rank,
                 first_seen_at=first_seen_at,
                 last_active_at=last_active_at,
             )
@@ -99,11 +101,31 @@ class TraderRepo:
                 trader.avg_trades_per_week = avg_trades_per_week
             if avg_profit_per_trade is not None:
                 trader.avg_profit_per_trade = avg_profit_per_trade
+            if leaderboard_rank is not None:
+                trader.leaderboard_rank = leaderboard_rank
+            # Never overwrite is_pinned — managed by /track and /untrack commands
             if first_seen_at is not None:
                 trader.first_seen_at = first_seen_at
             if last_active_at is not None:
                 trader.last_active_at = last_active_at
         await self._session.flush()
+        return trader
+
+    async def pin(self, address: str) -> Optional[Trader]:
+        """Pin a trader so they are never auto-dropped by discovery."""
+        trader = await self.get_by_address(address)
+        if trader:
+            trader.is_pinned = True
+            trader.status = "active"
+            await self._session.flush()
+        return trader
+
+    async def unpin(self, address: str) -> Optional[Trader]:
+        """Unpin a trader (allow auto-management by discovery again)."""
+        trader = await self.get_by_address(address)
+        if trader:
+            trader.is_pinned = False
+            await self._session.flush()
         return trader
 
     async def update_status(self, trader_id: int, status: str) -> None:

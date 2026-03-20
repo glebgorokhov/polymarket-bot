@@ -275,9 +275,13 @@ def _format_trader_card(trader) -> str:
     else:
         last_active = "—"
 
+    rank_str = f"  🏅 #{trader.leaderboard_rank}" if trader.leaderboard_rank and trader.leaderboard_rank < 500 else ""
+    pin_str = "  📌" if getattr(trader, "is_pinned", False) else ""
+    pnl_str = f"+${trader.total_pnl:,.0f}" if trader.total_pnl >= 0 else f"-${abs(trader.total_pnl):,.0f}"
+
     return (
-        f"{status_icon} <b><a href=\"{profile_url}\">{name}</a></b>  "
-        f"Score: <b>{trader.score:.3f}</b>\n"
+        f"{status_icon} <b><a href=\"{profile_url}\">{name}</a></b>{rank_str}{pin_str}\n"
+        f"💰 {pnl_str} total  ·  Score: <b>{trader.score:.3f}</b>\n"
         f"📊 {trader.trade_count:,} trades · {trades_per_week} · last active {last_active}\n"
         f"🏆 Win rate: {win_rate} · Consistency: {consistency} · Avg: {profit_str}\n"
         f"{heatmap}"
@@ -562,6 +566,113 @@ async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
 
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_track(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handle /track <address_or_username>. Manually pin a trader for active monitoring.
+    Bypasses scoring gates — pinned traders are never auto-dropped.
+    """
+    if not _is_admin(update):
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "Usage: /track <address>\nExample: /track 0x2005d16a84ceefa912d4e380cd32e7ff827875ea"
+        )
+        return
+
+    target = args[0].strip()
+    address = target if target.startswith("0x") else None
+
+    # If not an address, look up by username via leaderboard
+    if not address:
+        try:
+            from api.data_api import DataApiClient
+            async with DataApiClient() as client:
+                lb = await client.get_leaderboard(limit=200, category="OVERALL")
+            for e in lb:
+                name = (e.get("userName") or "").lower()
+                if name == target.lower():
+                    address = e.get("proxyWallet", "")
+                    break
+        except Exception as exc:
+            logger.error("Leaderboard lookup failed: %s", exc)
+
+    if not address:
+        await update.message.reply_text(f"❌ Couldn't find trader: {target}\nTip: use the full 0x address for reliability.")
+        return
+
+    # Fetch their profile from leaderboard for display name and PnL
+    lb_entry: dict = {}
+    try:
+        from api.data_api import DataApiClient
+        async with DataApiClient() as client:
+            lb = await client.get_leaderboard(limit=200, category="OVERALL")
+        for e in lb:
+            if (e.get("proxyWallet") or "").lower() == address.lower():
+                lb_entry = e
+                break
+    except Exception:
+        pass
+
+    async with get_session() as session:
+        trader_repo = TraderRepo(session)
+        existing = await trader_repo.get_by_address(address)
+
+        if existing:
+            existing.is_pinned = True
+            existing.status = "active"
+            await session.flush()
+            name = existing.display_name or address[:16] + "…"
+            await update.message.reply_text(
+                f"📌 <b>{name}</b> pinned and set to active.\n"
+                f"Already in DB — will now never be auto-dropped.",
+                parse_mode="HTML",
+            )
+        else:
+            # Add them fresh
+            display_name = lb_entry.get("userName") or target
+            total_pnl = float(lb_entry.get("pnl", 0) or 0)
+            new_trader = await trader_repo.upsert(
+                address=address,
+                display_name=display_name,
+                score=0.5,  # Placeholder until discovery scores them
+                status="active",
+                total_pnl=total_pnl,
+                leaderboard_rank=int(lb_entry.get("rank", 9999) or 9999) if lb_entry else None,
+            )
+            new_trader.is_pinned = True
+            await session.flush()
+            profile_url = f"https://polymarket.com/profile/{address}"
+            pnl_str = f"+${total_pnl:,.0f}" if total_pnl > 0 else f"${total_pnl:,.0f}"
+            await update.message.reply_text(
+                f"📌 <b><a href=\"{profile_url}\">{display_name}</a></b> added and pinned!\n"
+                f"💰 Leaderboard PnL: {pnl_str}\n"
+                f"⚡ Now actively monitored. Stats will update on next discovery.",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+
+
+async def cmd_untrack(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handle /untrack <address>. Unpin a trader (returns them to auto-management).
+    """
+    if not _is_admin(update):
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Usage: /untrack <address>")
+        return
+    address = args[0].strip()
+    async with get_session() as session:
+        trader = await TraderRepo(session).unpin(address)
+    if trader:
+        name = trader.display_name or address[:16] + "…"
+        await update.message.reply_text(f"🔓 <b>{name}</b> unpinned — discovery will auto-manage them.", parse_mode="HTML")
+    else:
+        await update.message.reply_text(f"❌ Trader not found: {address[:16]}…")
 
 
 async def cmd_discover(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

@@ -48,6 +48,8 @@ class Trader(Base):
     win_rate: Mapped[Optional[float]] = mapped_column(Float, nullable=True)          # fraction of weeks profitable
     avg_trades_per_week: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     avg_profit_per_trade: Mapped[Optional[float]] = mapped_column(Float, nullable=True)  # avg cash flow per trade
+    is_pinned: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)  # manually added, never auto-dropped
+    leaderboard_rank: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # overall leaderboard rank
     first_seen_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     last_active_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     added_at: Mapped[datetime] = mapped_column(
