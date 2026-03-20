@@ -141,9 +141,11 @@ async def execute_copy_trade(signal: Signal, mode: str) -> None:
         _trader_display = (getattr(_trader, "display_name", None) if _trader else None)
         if _trader_display and _trader_addr:
             _trader_display = f'<a href="https://polymarket.com/profile/{_trader_addr}">{_trader_display}</a>'
+        _event_slug = getattr(signal, "_event_slug", "") or ""
         await send_notification(signal_detected_manual(
             signal, triggered_slugs, market_name,
             trader_name=_trader_display,
+            event_slug=_event_slug,
         ))
         return
 

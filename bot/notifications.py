@@ -103,7 +103,8 @@ def signal_detected_manual(
     strat_lines = "  · " + "\n  · ".join(strat_labels.get(s, s) for s in triggered_slugs)
 
     cond_id = signal.market_condition_id or ""
-    market_url = f"https://polymarket.com/event/{event_slug or cond_id}"
+    _slug = event_slug or getattr(signal, "_event_slug", "") or cond_id
+    market_url = f"https://polymarket.com/event/{_slug}" if _slug else ""
     short_name = (market_name or cond_id[:20])[:65]
     if market_name and len(market_name) > 65:
         short_name += "…"
@@ -224,7 +225,8 @@ def signal_detected(
         market_display = cond_id[:20] + "…"
 
     # Build polymarket link from eventSlug if we have conditionId
-    market_url = f"https://polymarket.com/event/{cond_id}" if cond_id else ""
+    _evt_slug = getattr(signal, "_event_slug", "") or cond_id
+    market_url = f"https://polymarket.com/event/{_evt_slug}" if _evt_slug else ""
 
     addr = getattr(signal, "_trader_address", "") or ""
     trader_link = f'<a href="https://polymarket.com/profile/{addr}">{name}</a>' if addr else f"<b>{name}</b>"

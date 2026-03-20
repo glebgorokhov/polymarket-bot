@@ -255,6 +255,8 @@ async def _process_trade(
         market_name = trade.get("title", "Unknown Market")
         market_category = "UNKNOWN"
 
+    event_slug = trade.get("eventSlug") or trade.get("slug") or ""
+
     # token_id: Data API doesn't return it — look up from CLOB via conditionId + outcomeIndex
     token_id = trade.get("asset_id") or trade.get("asset") or trade.get("tokenId") or ""
     outcome_index = int(trade.get("outcomeIndex", 0) or 0)
@@ -332,6 +334,7 @@ async def _process_trade(
 
         # Notify via bot
         signal._trader_address = trader.address  # type: ignore[attr-defined]
+        signal._event_slug = event_slug  # type: ignore[attr-defined]
         from bot.notifications import signal_detected
         from bot import notifications as notif
         await notif.send_notification(signal_detected(
@@ -340,6 +343,7 @@ async def _process_trade(
             skip_reason=skip_reason,
             trader_name=trader.display_name or trader.address[:12] + "…",
             market_name=market_name,
+            event_slug=event_slug,
         ))
         return
 
@@ -347,6 +351,7 @@ async def _process_trade(
     signal.market_category = market_category  # type: ignore[attr-defined]
     signal.trader = trader  # type: ignore[attr-defined]
     signal._trader_address = trader.address  # type: ignore[attr-defined]
+    signal._event_slug = event_slug  # type: ignore[attr-defined]
 
     # Hand off to executor
     from core import executor
