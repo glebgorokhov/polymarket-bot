@@ -28,10 +28,7 @@ _WATCHING_N = 500               # Max stored in DB for scoring/reference
 _SCORE_THRESHOLD = 0.30         # Minimum score to stay in DB at all
 _MIN_TRADES = 30                # Require at least 30 total trades
 _MIN_MONTHS_ACTIVE = 3          # Require at least 3 months of history
-_MAX_INACTIVE_DAYS = 60         # Hard gate: traders not active in 60d are excluded entirely
-# VIP bypass: top leaderboard traders skip the monthly consistency gate if still active.
-_VIP_MIN_PNL = 10_000.0
-_VIP_MIN_VOLUME = 100_000.0
+# No VIP bypass — everyone must pass the same gates. Short history = lucky bet, not a pattern.
 
 # All Polymarket categories to pull from
 _CATEGORIES = [
@@ -367,50 +364,33 @@ async def _score_candidate(address: str, entry: dict) -> Optional[tuple[float, d
 
     Returns None if they fail hard gates (too few trades, not enough history).
     """
-    leaderboard_pnl = float(entry.get("pnl", 0) or 0)
-    leaderboard_vol = float(entry.get("vol", 0) or 0)
     leaderboard_rank = int(entry.get("rank", 9999) or 9999)
-    is_vip = leaderboard_pnl >= _VIP_MIN_PNL and leaderboard_vol >= _VIP_MIN_VOLUME
 
     try:
         async with DataApiClient() as data_client:
             trades = await data_client.get_all_trades(user=address)
 
-        if len(trades) < 5:  # Absolute minimum — at least some history
+        if len(trades) < _MIN_TRADES:
             return None
 
         monthly_history = await _build_monthly_pnl_history(trades)
+        if len(monthly_history) < _MIN_MONTHS_ACTIVE:
+            return None
+
         weekly_history = await _build_weekly_pnl_history(trades)
         extra_stats = _compute_extra_stats(trades, weekly_history)
         last_trade_ts = _parse_trade_ts(trades[0]) if trades else None
 
-        # Universal hard gate: inactive traders can't be copied
+        # Hard gate: inactive traders can't be copied
         if _compute_recency_multiplier(last_trade_ts) == 0.0:
-            return None  # >60 days inactive — skip entirely
+            return None  # >60 days inactive
 
-        # Additional gates bypassed for VIP traders
-        if not is_vip:
-            if len(trades) < _MIN_TRADES:
-                return None
-            if len(monthly_history) < _MIN_MONTHS_ACTIVE:
-                return None
-
-        if is_vip and len(monthly_history) < _MIN_MONTHS_ACTIVE:
-            # VIP with short history: base score 0.5, but recency still applies as multiplier
-            recency_mult = _compute_recency_multiplier(last_trade_ts)
-            if recency_mult == 0.0:
-                logger.info("VIP %s skipped — inactive >60d despite rank=%d", address[:16], leaderboard_rank)
-                return None  # Even VIPs can't be copied if dormant
-            score = round(0.5 * recency_mult, 4)
-            logger.info("VIP bypass for %s (rank=%d, PnL=$%.0f) recency_mult=%.2f → score=%.3f",
-                        address[:16], leaderboard_rank, leaderboard_pnl, recency_mult, score)
-        else:
-            score = compute_composite_score(
-                monthly_pnl_history=monthly_history,
-                trade_count=len(trades),
-                last_active_at=last_trade_ts,
-                weekly_pnl_history=weekly_history,
-            )
+        score = compute_composite_score(
+            monthly_pnl_history=monthly_history,
+            trade_count=len(trades),
+            last_active_at=last_trade_ts,
+            weekly_pnl_history=weekly_history,
+        )
 
         return (score, {
             "address": address,
