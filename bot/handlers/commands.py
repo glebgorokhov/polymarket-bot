@@ -589,13 +589,16 @@ async def cmd_feed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 trades = await client.get_trades(user=trader.address, limit=5)
             result = []
             for t in trades:
-                result.append({
+                slug = t.get("slug") or t.get("eventSlug") or t.get("marketSlug") or ""
+                        result.append({
                     "trader_name": trader.display_name or trader.address[:12] + "…",
                     "trader_address": trader.address,
                     "trader_score": trader.score,
-                    "market": t.get("market") or t.get("conditionId") or t.get("condition_id", ""),
-                    "market_slug": t.get("market_slug") or t.get("marketSlug", ""),
-                    "outcome": t.get("outcome") or t.get("title", ""),
+                    "market": t.get("conditionId") or t.get("condition_id", ""),
+                    "market_title": t.get("title") or slug.replace("-", " ").title() or "Unknown market",
+                    "market_slug": slug,
+                    "market_url": f"https://polymarket.com/event/{slug}" if slug else "",
+                    "outcome": t.get("outcome") or "?",
                     "side": t.get("side", "").upper(),
                     "price": float(t.get("price", 0) or 0),
                     "size": float(t.get("size", 0) or 0),
@@ -636,8 +639,13 @@ async def cmd_feed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         # Only show markets with actual activity worth noting
         unique_traders = len({t["trader_address"] for t in trades})
 
-        # Determine market name from outcome or slug
-        market_name = trades[0].get("market_slug") or trades[0].get("outcome") or condition_id[:20]
+        # Market name + link
+        market_title = trades[0].get("market_title") or condition_id[:20]
+        market_url = trades[0].get("market_url") or ""
+        if market_url:
+            market_display = f'<a href="{market_url}">{market_title[:55]}</a>'
+        else:
+            market_display = market_title[:55]
 
         # Conflict indicator
         if buyers and sellers:
@@ -647,12 +655,13 @@ async def cmd_feed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         else:
             conflict = ""
 
-        lines.append(f"🏪 <b>{market_name}</b>{conflict}")
+        lines.append(f"🏪 <b>{market_display}</b>{conflict}")
 
         for t in sorted(trades, key=lambda x: x["usd_value"], reverse=True)[:5]:
             side_icon = "🔵" if t["side"] == "BUY" else "🔴"
+            outcome_str = f" [{t['outcome']}]" if t.get("outcome") and t["outcome"] != "?" else ""
             lines.append(
-                f"  {side_icon} {t['trader_name']} — {t['side']} @ {t['price']:.2f} · ${t['usd_value']:.0f}"
+                f"  {side_icon} <b>{t['trader_name']}</b>{outcome_str} — {t['side']} @ {t['price']:.2f} · ${t['usd_value']:.0f}"
             )
         lines.append("")
         shown += 1
