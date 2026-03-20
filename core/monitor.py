@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 _SPREAD_LIMIT = 0.10  # 10% max spread
 _PRICE_STALENESS_MIN = 15  # Minutes before price considered stale
-_RESOLVE_SOON_HOURS = 48  # Skip markets resolving within 48h
+_RESOLVE_SOON_HOURS = 0   # Don't skip based on time — only skip truly closed markets
 
 
 async def validate_signal(
@@ -77,8 +77,9 @@ async def validate_signal(
             hours_remaining = (end_date - now).total_seconds() / 3600
             if hours_remaining < 0:
                 return False, "market_already_resolved"
-            if hours_remaining <= _RESOLVE_SOON_HOURS:
-                return False, f"resolving_in_{hours_remaining:.1f}h"
+            # Note: _RESOLVE_SOON_HOURS=0 means we don't skip based on time.
+            # Intraday traders (our main pool) trade 15-min markets — filtering
+            # by time would kill all their signals.
     except Exception as exc:
         logger.warning("Failed to validate market %s: %s", market_id, exc)
         return False, f"market_check_error: {exc}"
