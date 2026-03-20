@@ -11,6 +11,7 @@ from bot.handlers.callbacks import handle_callback
 from bot.handlers.commands import (
     cmd_budget,
     cmd_discover,
+    cmd_feed,
     cmd_help,
     cmd_track,
     cmd_untrack,
@@ -64,6 +65,7 @@ def create_app() -> Application:
     app.add_handler(CommandHandler("resume", cmd_resume))
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("signals", cmd_signals))
+    app.add_handler(CommandHandler("feed", cmd_feed))
     app.add_handler(CommandHandler("track", cmd_track))
     app.add_handler(CommandHandler("untrack", cmd_untrack))
     app.add_handler(CommandHandler("track", cmd_track))

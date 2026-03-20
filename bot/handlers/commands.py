@@ -74,7 +74,9 @@ async def _build_status_text() -> str:
     """Build the status message string."""
     cfg = get_settings()
 
-    # Get balance from CLOB
+    # Get balance from CLOB — requires py-clob-client auth
+    balance = None
+    balance_source = "live"
     try:
         from api.clob import ClobApiClient
         clob = ClobApiClient(
@@ -82,9 +84,12 @@ async def _build_status_text() -> str:
             relayer_api_address=cfg.relayer_api_address,
             signer_address=cfg.signer_address,
         )
-        balance = await clob.get_balance()
-    except Exception:
-        balance = 0.0
+        raw_balance = await clob.get_balance()
+        balance = float(raw_balance or 0)
+    except Exception as exc:
+        logger.warning("CLOB balance fetch failed: %s", exc)
+        balance = None
+        balance_source = "unavailable"
 
     async with get_session() as session:
         settings_repo = SettingsRepo(session)
@@ -101,9 +106,15 @@ async def _build_status_text() -> str:
         today_pnl = sum(p.pnl or 0 for p in closed_today if not p.is_shadow)
 
     shadow_note = f" (+{len(shadow_positions)} shadow)" if shadow_positions else ""
+
+    if balance is not None:
+        bal_str = f"${balance:.2f} (live)"
+    else:
+        bal_str = "⚠️ unavailable (CLOB auth failed)"
+
     return (
         f"📊 <b>Status</b>\n\n"
-        f"💰 Balance: ${balance:.2f}\n"
+        f"💰 Balance: {bal_str}\n"
         f"📦 Deployed: ${deployed:.2f}\n"
         f"📈 Today P&L: {'+' if today_pnl >= 0 else ''}${today_pnl:.2f}\n"
         f"🔄 Mode: <b>{mode.upper()}</b>\n"
@@ -532,6 +543,117 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         lines.append(f"  <b>{key}</b>: <code>{value}</code>")
 
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_feed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handle /feed. Shows recent trades from tracked traders grouped by market.
+    Highlights markets where multiple traders bet, and opposite bets.
+    """
+    if not _is_admin(update):
+        return
+
+    await update.message.reply_text("🔄 Fetching recent activity from tracked traders...")
+
+    async with get_session() as session:
+        trader_repo = TraderRepo(session)
+        active_traders = list(await trader_repo.get_active())
+
+    # Limit to top 20 by score to avoid too many API calls
+    top_traders = sorted(active_traders, key=lambda t: t.score, reverse=True)[:20]
+
+    if not top_traders:
+        await update.message.reply_text("No active traders yet. Run /discover first.")
+        return
+
+    from api.data_api import DataApiClient
+
+    # Fetch last 5 trades for each trader concurrently
+    market_activity: dict[str, list[dict]] = {}  # condition_id → list of trade+trader info
+
+    async def fetch_trader_trades(trader) -> list[dict]:
+        try:
+            async with DataApiClient() as client:
+                trades = await client.get_trades(user=trader.address, limit=5)
+            result = []
+            for t in trades:
+                result.append({
+                    "trader_name": trader.display_name or trader.address[:12] + "…",
+                    "trader_address": trader.address,
+                    "trader_score": trader.score,
+                    "market": t.get("market") or t.get("conditionId") or t.get("condition_id", ""),
+                    "market_slug": t.get("market_slug") or t.get("marketSlug", ""),
+                    "outcome": t.get("outcome") or t.get("title", ""),
+                    "side": t.get("side", "").upper(),
+                    "price": float(t.get("price", 0) or 0),
+                    "size": float(t.get("size", 0) or 0),
+                    "usd_value": float(t.get("size", 0) or 0) * float(t.get("price", 0) or 0),
+                    "timestamp": t.get("timestamp", ""),
+                })
+            return result
+        except Exception:
+            return []
+
+    import asyncio
+    all_results = await asyncio.gather(*[fetch_trader_trades(t) for t in top_traders])
+
+    # Group by market
+    for trader_trades in all_results:
+        for trade in trader_trades:
+            mid = trade["market"]
+            if not mid:
+                continue
+            if mid not in market_activity:
+                market_activity[mid] = []
+            market_activity[mid].append(trade)
+
+    # Sort markets by number of participating traders (most interesting first)
+    sorted_markets = sorted(market_activity.items(), key=lambda x: len(x[1]), reverse=True)
+
+    if not sorted_markets:
+        await update.message.reply_text("No recent trade activity found.")
+        return
+
+    lines = [f"📰 <b>Recent Market Activity</b> — top {len(top_traders)} traders\n"]
+    shown = 0
+
+    for condition_id, trades in sorted_markets[:15]:
+        buyers = [t for t in trades if t["side"] == "BUY"]
+        sellers = [t for t in trades if t["side"] == "SELL"]
+
+        # Only show markets with actual activity worth noting
+        unique_traders = len({t["trader_address"] for t in trades})
+
+        # Determine market name from outcome or slug
+        market_name = trades[0].get("market_slug") or trades[0].get("outcome") or condition_id[:20]
+
+        # Conflict indicator
+        if buyers and sellers:
+            conflict = " ⚡ <i>SPLIT</i>"
+        elif len(set(t["trader_address"] for t in trades)) > 1:
+            conflict = " 🤝 <i>consensus</i>"
+        else:
+            conflict = ""
+
+        lines.append(f"🏪 <b>{market_name}</b>{conflict}")
+
+        for t in sorted(trades, key=lambda x: x["usd_value"], reverse=True)[:5]:
+            side_icon = "🔵" if t["side"] == "BUY" else "🔴"
+            lines.append(
+                f"  {side_icon} {t['trader_name']} — {t['side']} @ {t['price']:.2f} · ${t['usd_value']:.0f}"
+            )
+        lines.append("")
+        shown += 1
+
+    if not shown:
+        lines.append("No notable activity in the last 5 trades per trader.")
+
+    # Telegram message limit is 4096 chars — truncate if needed
+    text = "\n".join(lines)
+    if len(text) > 3900:
+        text = text[:3900] + "\n…"
+
+    await update.message.reply_text(text, parse_mode="HTML")
 
 
 async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

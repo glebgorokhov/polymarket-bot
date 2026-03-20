@@ -77,14 +77,13 @@ class SignalRepo:
             signal.skip_reason = skip_reason
 
     async def get_latest(self, limit: int = 20) -> Sequence[Signal]:
-        """Return the most recent N signals across all traders."""
-        from db.models import Trader
+        """Return the most recent N signals across all traders, with trader eagerly loaded."""
+        from sqlalchemy.orm import joinedload
         result = await self._session.execute(
             select(Signal)
-            .join(Trader, Signal.trader_id == Trader.id)
+            .options(joinedload(Signal.trader))
             .order_by(Signal.detected_at.desc())
             .limit(limit)
-            .options(__import__('sqlalchemy.orm', fromlist=['joinedload']).joinedload(Signal.trader))
         )
         return result.scalars().all()
 
