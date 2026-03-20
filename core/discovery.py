@@ -1,120 +1,108 @@
 """
 Trader discovery and scoring engine.
-Pulls Polymarket leaderboard data, scores traders using a composite formula,
-and manages the set of tracked wallets in the DB.
+
+Strategy:
+- Pull top 50 from each Polymarket category (10 categories) = ~400 unique candidates
+- Score every candidate on consistency, Sharpe, diversity, frequency, recency
+- Consistency is weighted 50% — we want steady gainers, not lucky one-hit wonders
+- Store top 500 in DB with status='watching'
+- Promote top 50 by score to status='active' (these get polled every 30s)
+- Weekly refresh: re-score all, rotate active/watching accordingly
 """
 
+import asyncio
 import logging
 import statistics
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from api.data_api import DataApiClient
-from api.gamma import GammaApiClient
 from db.models import Trader
 from db.repos.traders import TraderRepo, TraderSnapshotRepo
 from db.session import get_session
 
 logger = logging.getLogger(__name__)
 
-_TOP_N = 10  # Number of traders to track
-_SCORE_THRESHOLD = 0.4  # Minimum composite score to stay active
-_LEADERBOARD_LIMIT = 100  # How many leaderboard entries to fetch
+_ACTIVE_N = 50       # Traders polled every 30s (real monitoring)
+_WATCHING_N = 500    # Max stored in DB for scoring/reference
+_SCORE_THRESHOLD = 0.25   # Minimum score to stay active
+_MIN_TRADES = 30          # Require at least 30 total trades
+_MIN_MONTHS_ACTIVE = 3    # Require at least 3 months of history
+
+# All Polymarket categories to pull from
+_CATEGORIES = [
+    "OVERALL", "POLITICS", "SPORTS", "CRYPTO",
+    "CULTURE", "ECONOMICS", "TECH", "FINANCE",
+    "WEATHER",
+]
+
+# Time periods to pull from per category
+_TIME_PERIODS = ["ALL", "MONTH"]
 
 
 def _compute_consistency_score(monthly_pnl_history: list[dict]) -> float:
     """
-    Compute consistency score from monthly PnL history.
+    Consistency = fraction of months with positive net cash flow.
+    Uses last 6 months. This is the most important metric.
 
-    consistency = months_profitable / 6 (last 6 months).
-
-    Args:
-        monthly_pnl_history: List of {month: str, pnl: float} dicts.
-
-    Returns:
-        Consistency score in [0, 1].
+    A trader with 6/6 profitable months scores 1.0.
+    One with 3/6 scores 0.5.
     """
     if not monthly_pnl_history:
         return 0.0
     recent = monthly_pnl_history[-6:]
+    if len(recent) < _MIN_MONTHS_ACTIVE:
+        # Penalize traders without enough history
+        return 0.0
     profitable = sum(1 for m in recent if m.get("pnl", 0) > 0)
-    return profitable / 6.0
+    return profitable / max(len(recent), 1)
 
 
 def _compute_sharpe_normalized(monthly_pnl_history: list[dict]) -> float:
     """
-    Compute normalized Sharpe-like ratio from monthly returns.
-
-    sharpe = mean / std (clamped 0-3, then /3 to normalize).
-
-    Args:
-        monthly_pnl_history: List of {month: str, pnl: float} dicts.
-
-    Returns:
-        Normalized Sharpe ratio in [0, 1].
+    Normalized Sharpe-like ratio: mean monthly return / std deviation.
+    Clamped to [0, 3] then divided by 3 to get [0, 1].
+    High Sharpe = consistent gains relative to volatility.
     """
     if len(monthly_pnl_history) < 2:
         return 0.0
     returns = [m.get("pnl", 0.0) for m in monthly_pnl_history]
     mean_ret = statistics.mean(returns)
-    std_ret = statistics.stdev(returns)
+    try:
+        std_ret = statistics.stdev(returns)
+    except statistics.StatisticsError:
+        return 0.0
     if std_ret == 0:
         return 1.0 if mean_ret > 0 else 0.0
     raw_sharpe = mean_ret / std_ret
-    clamped = max(0.0, min(3.0, raw_sharpe))
-    return clamped / 3.0
+    return max(0.0, min(3.0, raw_sharpe)) / 3.0
 
 
-def _compute_diversity_score(category_strengths: dict) -> float:
+def _compute_diversity_score(monthly_pnl_history: list[dict], trade_count: int) -> float:
     """
-    Compute diversity score from category strengths.
-
-    diversity = unique_categories_with_activity / total_known_categories.
-
-    Args:
-        category_strengths: Dict of {category: strength}.
-
-    Returns:
-        Diversity score in [0, 1].
+    Diversity proxy: traders with many trades over many months
+    are likely diversified across markets.
+    Penalizes traders who made 1 giant bet.
     """
-    total_categories = 8  # Approximate number of Polymarket categories
-    if not category_strengths:
+    if not monthly_pnl_history or trade_count == 0:
         return 0.0
-    active = sum(1 for v in category_strengths.values() if v > 0)
-    return min(active / total_categories, 1.0)
+    months_active = len([m for m in monthly_pnl_history if m.get("pnl", 0) != 0])
+    # Average trades per active month — we want people making multiple trades/month
+    trades_per_month = trade_count / max(months_active, 1)
+    # Score: 10+ trades/month = 1.0, fewer = proportional
+    return min(trades_per_month / 10.0, 1.0)
 
 
 def _compute_frequency_score(trades_per_month: float) -> float:
-    """
-    Compute frequency score from average monthly trade count.
-
-    frequency = min(trades_per_month / 10, 1.0)
-
-    Args:
-        trades_per_month: Average number of trades per month.
-
-    Returns:
-        Frequency score in [0, 1].
-    """
+    """High frequency = actively trading, not just sitting on 1 position."""
     return min(trades_per_month / 10.0, 1.0)
 
 
 def _compute_recency_score(last_active_at: Optional[datetime]) -> float:
-    """
-    Compute recency score based on last activity timestamp.
-
-    1.0 if active within 14d, 0.5 if within 30d, else 0.
-
-    Args:
-        last_active_at: Datetime of last known trade.
-
-    Returns:
-        Recency score: 0.0, 0.5, or 1.0.
-    """
+    """Penalize dormant traders. 1.0 if active within 14d, 0.5 within 30d, else 0."""
     if last_active_at is None:
         return 0.0
     now = datetime.now(timezone.utc)
-    # Ensure timezone-aware comparison
     if last_active_at.tzinfo is None:
         last_active_at = last_active_at.replace(tzinfo=timezone.utc)
     days_ago = (now - last_active_at).days
@@ -125,101 +113,85 @@ def _compute_recency_score(last_active_at: Optional[datetime]) -> float:
     return 0.0
 
 
+def _compute_winning_streak_bonus(monthly_pnl_history: list[dict]) -> float:
+    """
+    Bonus for recent consecutive profitable months.
+    3 months in a row = 0.1 bonus, 6 months = 0.2.
+    """
+    if not monthly_pnl_history:
+        return 0.0
+    streak = 0
+    for m in reversed(monthly_pnl_history[-6:]):
+        if m.get("pnl", 0) > 0:
+            streak += 1
+        else:
+            break
+    return min(streak * 0.033, 0.2)  # cap at 0.2
+
+
 def compute_composite_score(
     monthly_pnl_history: list[dict],
-    category_strengths: dict,
-    trades_per_month: float,
+    trade_count: int,
     last_active_at: Optional[datetime],
 ) -> float:
     """
-    Compute the composite trader quality score.
+    Composite trader quality score, heavily weighted toward consistency.
 
     Formula:
-        composite = (consistency * 0.35) + (sharpe_norm * 0.25)
-                  + (diversity * 0.15) + (frequency * 0.15)
-                  + (recency * 0.10)
+        score = (consistency * 0.50)   ← dominant factor
+              + (sharpe * 0.20)
+              + (diversity * 0.15)
+              + (recency * 0.10)
+              + (frequency * 0.05)
+              + streak_bonus (up to 0.20)
+        capped at 1.0
 
     Args:
-        monthly_pnl_history: Monthly PnL records.
-        category_strengths: Per-category win rates.
-        trades_per_month: Average monthly trade count.
-        last_active_at: Last trade timestamp.
+        monthly_pnl_history: List of {month: "YYYY-MM", pnl: float} dicts.
+        trade_count: Total lifetime trade count.
+        last_active_at: Timestamp of last trade.
 
     Returns:
         Composite score in [0, 1].
     """
+    # Hard gate: not enough history or trades
+    if trade_count < _MIN_TRADES:
+        return 0.0
+    if len(monthly_pnl_history) < _MIN_MONTHS_ACTIVE:
+        return 0.0
+
+    months_active = len([m for m in monthly_pnl_history if m.get("pnl", 0) != 0])
+    trades_per_month = trade_count / max(months_active, 1)
+
     consistency = _compute_consistency_score(monthly_pnl_history)
     sharpe_norm = _compute_sharpe_normalized(monthly_pnl_history)
-    diversity = _compute_diversity_score(category_strengths)
-    frequency = _compute_frequency_score(trades_per_month)
+    diversity = _compute_diversity_score(monthly_pnl_history, trade_count)
     recency = _compute_recency_score(last_active_at)
+    frequency = _compute_frequency_score(trades_per_month)
+    streak_bonus = _compute_winning_streak_bonus(monthly_pnl_history)
 
-    score = (
-        consistency * 0.35
-        + sharpe_norm * 0.25
+    base_score = (
+        consistency * 0.50
+        + sharpe_norm * 0.20
         + diversity * 0.15
-        + frequency * 0.15
         + recency * 0.10
+        + frequency * 0.05
     )
+    score = min(base_score + streak_bonus, 1.0)
+
     logger.debug(
-        "Score: consistency=%.2f sharpe=%.2f diversity=%.2f freq=%.2f recency=%.2f → %.3f",
-        consistency,
-        sharpe_norm,
-        diversity,
-        frequency,
-        recency,
-        score,
+        "Score: consistency=%.2f sharpe=%.2f diversity=%.2f recency=%.2f freq=%.2f streak=%.2f → %.3f",
+        consistency, sharpe_norm, diversity, recency, frequency, streak_bonus, score,
     )
     return round(score, 4)
 
 
-async def compute_category_strengths(address: str) -> dict[str, float]:
-    """
-    Compute win rates per category for a trader from their trade history.
-
-    Args:
-        address: Trader's on-chain address.
-
-    Returns:
-        Dict of {category: win_rate} where win_rate is in [0, 1].
-    """
-    async with DataApiClient() as data_client:
-        trades = await data_client.get_trades(user=address, limit=200)
-
-    # Group trades by market and track outcomes
-    # Trades with positive realized PnL are wins
-    category_stats: dict[str, dict] = {}
-    for trade in trades:
-        category = trade.get("market", {}).get("category", "UNKNOWN") if isinstance(trade.get("market"), dict) else "UNKNOWN"
-        if not category:
-            category = "UNKNOWN"
-        if category not in category_stats:
-            category_stats[category] = {"wins": 0, "total": 0}
-        pnl = float(trade.get("profit", trade.get("pnl", 0)) or 0)
-        category_stats[category]["total"] += 1
-        if pnl > 0:
-            category_stats[category]["wins"] += 1
-
-    strengths: dict[str, float] = {}
-    for cat, stats in category_stats.items():
-        if stats["total"] > 0:
-            strengths[cat] = round(stats["wins"] / stats["total"], 3)
-
-    return strengths
-
-
 async def _build_monthly_pnl_history(trades: list[dict]) -> list[dict]:
     """
-    Aggregate trades into monthly PnL records.
+    Aggregate trades into monthly cash-flow records.
 
-    Uses buy/sell to estimate PnL: buys are negative cash flow, sells positive.
-    This is a rough approximation — real PnL needs resolved market data.
-
-    Args:
-        trades: Raw trade dicts from Data API.
-
-    Returns:
-        List of {month: "YYYY-MM", pnl: float} sorted ascending.
+    Buys = negative cash flow, Sells = positive.
+    This approximates realized PnL from trade activity.
     """
     monthly: dict[str, float] = {}
     for trade in trades:
@@ -227,115 +199,180 @@ async def _build_monthly_pnl_history(trades: list[dict]) -> list[dict]:
         if not ts_raw:
             continue
         try:
-            # Timestamp can be Unix int or ISO string
             if isinstance(ts_raw, (int, float)):
-                ts = datetime.fromtimestamp(ts_raw, tz=timezone.utc)
+                ts = datetime.fromtimestamp(float(ts_raw), tz=timezone.utc)
             else:
                 ts = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00"))
             key = ts.strftime("%Y-%m")
             size = float(trade.get("size", 0) or 0)
             price = float(trade.get("price", 0) or 0)
             side = trade.get("side", "").upper()
-            # Rough PnL: sells add cash, buys subtract
+            # Sells add value, buys subtract — rough but consistent proxy
             cash_flow = size * price if side == "SELL" else -(size * price)
             monthly[key] = monthly.get(key, 0.0) + cash_flow
         except (ValueError, TypeError):
             continue
-
     return [{"month": k, "pnl": v} for k, v in sorted(monthly.items())]
+
+
+async def _fetch_all_leaderboard_candidates() -> dict[str, dict]:
+    """
+    Pull candidates from all categories and time periods.
+    Returns a dict keyed by proxyWallet address (deduplicates automatically).
+    """
+    candidates: dict[str, dict] = {}
+
+    async with DataApiClient() as data_client:
+        for category in _CATEGORIES:
+            for time_period in _TIME_PERIODS:
+                try:
+                    # Pull pages: 50 per page, up to 3 pages = 150 per category/period
+                    for offset in range(0, 150, 50):
+                        entries = await data_client.get_leaderboard(
+                            category=category,
+                            time_period=time_period,
+                            order_by="PNL",
+                            limit=50,
+                            offset=offset,
+                        )
+                        if not entries:
+                            break
+                        for entry in entries:
+                            address = entry.get("proxyWallet", "")
+                            if not address:
+                                continue
+                            # Keep the entry with higher PnL if duplicate
+                            existing_pnl = candidates.get(address, {}).get("pnl", 0)
+                            entry_pnl = float(entry.get("pnl", 0) or 0)
+                            if address not in candidates or entry_pnl > existing_pnl:
+                                candidates[address] = entry
+                        # Small delay to be respectful of API
+                        await asyncio.sleep(0.2)
+                except Exception as exc:
+                    logger.warning(
+                        "Leaderboard fetch failed (category=%s, period=%s): %s",
+                        category, time_period, exc,
+                    )
+                    continue
+
+    logger.info("Fetched %d unique candidates from leaderboard", len(candidates))
+    return candidates
+
+
+async def _score_candidate(address: str, entry: dict) -> Optional[tuple[float, dict]]:
+    """
+    Fetch trade history for a candidate and compute their composite score.
+    Returns None if they fail hard gates (too few trades, not enough history).
+    """
+    try:
+        async with DataApiClient() as data_client:
+            # Fetch up to 500 trades for a proper history
+            trades = await data_client.get_trades(user=address, limit=500)
+
+        if len(trades) < _MIN_TRADES:
+            return None
+
+        monthly_history = await _build_monthly_pnl_history(trades)
+        if len(monthly_history) < _MIN_MONTHS_ACTIVE:
+            return None
+
+        last_trade_ts: Optional[datetime] = None
+        if trades:
+            ts_raw = trades[0].get("timestamp")
+            if ts_raw:
+                if isinstance(ts_raw, (int, float)):
+                    last_trade_ts = datetime.fromtimestamp(float(ts_raw), tz=timezone.utc)
+                else:
+                    last_trade_ts = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00"))
+
+        score = compute_composite_score(
+            monthly_pnl_history=monthly_history,
+            trade_count=len(trades),
+            last_active_at=last_trade_ts,
+        )
+
+        return (score, {
+            "address": address,
+            "display_name": entry.get("userName", entry.get("name", "")),
+            "score": score,
+            "total_pnl": float(entry.get("pnl", 0) or 0),
+            "monthly_pnl_history": monthly_history,
+            "trade_count": len(trades),
+            "last_active_at": last_trade_ts,
+        })
+    except Exception as exc:
+        logger.debug("Failed to score candidate %s: %s", address, exc)
+        return None
 
 
 async def discover_top_traders() -> None:
     """
-    Pull the Polymarket leaderboard and store the top N traders in the DB.
+    Full trader discovery run.
 
-    Fetches the ALL-time leaderboard, computes composite scores for each
-    trader, selects the top _TOP_N by score, and upserts them with
-    status='active'. Existing tracked traders not in the new top N
-    are downgraded to status='watching'.
+    1. Pull all leaderboard candidates across categories (up to ~500 unique)
+    2. Score each one — heavily weight consistency
+    3. Store top _WATCHING_N in DB as 'watching'
+    4. Promote top _ACTIVE_N to 'active' (these get polled every 30s)
+    5. Downgrade existing active traders not in new top set
     """
-    logger.info("Starting trader discovery (top %d)", _TOP_N)
+    logger.info("Starting full trader discovery (active=%d, watching=%d)", _ACTIVE_N, _WATCHING_N)
 
-    async with DataApiClient() as data_client:
-        leaderboard = await data_client.get_leaderboard(
-            category="OVERALL",
-            time_period="ALL",
-            order_by="PNL",
-            limit=50,
-        )
-
-    if not leaderboard:
-        logger.warning("Leaderboard returned no results")
+    candidates = await _fetch_all_leaderboard_candidates()
+    if not candidates:
+        logger.warning("No candidates found — aborting discovery")
         return
 
+    # Score all candidates (with concurrency limit to avoid rate limits)
+    logger.info("Scoring %d candidates...", len(candidates))
     scored: list[tuple[float, dict]] = []
-    for entry in leaderboard:
-        address = entry.get("proxyWallet", entry.get("address", ""))
-        if not address:
-            continue
-        try:
-            async with DataApiClient() as data_client:
-                trades = await data_client.get_trades(user=address, limit=200)
-            monthly_history = await _build_monthly_pnl_history(trades)
-            category_strengths = await compute_category_strengths(address)
-            trades_per_month = len(trades) / max(len(monthly_history), 1)
+    semaphore = asyncio.Semaphore(5)  # Max 5 concurrent trade fetches
 
-            last_trade_ts: Optional[datetime] = None
-            if trades:
-                ts_raw = trades[0].get("timestamp")
-                if ts_raw:
-                    if isinstance(ts_raw, (int, float)):
-                        last_trade_ts = datetime.fromtimestamp(ts_raw, tz=timezone.utc)
-                    else:
-                        last_trade_ts = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00"))
+    async def score_with_sem(address: str, entry: dict) -> None:
+        async with semaphore:
+            result = await _score_candidate(address, entry)
+            if result is not None:
+                scored.append(result)
+            await asyncio.sleep(0.1)  # Rate limit courtesy
 
-            score = compute_composite_score(
-                monthly_pnl_history=monthly_history,
-                category_strengths=category_strengths,
-                trades_per_month=trades_per_month,
-                last_active_at=last_trade_ts,
-            )
-            scored.append((
-                score,
-                {
-                    "address": address,
-                    "display_name": entry.get("userName", entry.get("name", "")),
-                    "score": score,
-                    "category_strengths": category_strengths,
-                    "total_pnl": float(entry.get("pnl", entry.get("profit", 0)) or 0),
-                    "monthly_pnl_history": monthly_history,
-                    "trade_count": len(trades),
-                    "last_active_at": last_trade_ts,
-                },
-            ))
-        except Exception as exc:
-            logger.warning("Failed to score trader %s: %s", address, exc)
-            continue
+    tasks = [score_with_sem(addr, entry) for addr, entry in candidates.items()]
+    await asyncio.gather(*tasks)
 
-    # Sort by score descending, take top N
+    logger.info(
+        "Scored %d/%d candidates passed hard gates (min %d trades, %d months)",
+        len(scored), len(candidates), _MIN_TRADES, _MIN_MONTHS_ACTIVE,
+    )
+
+    if not scored:
+        logger.warning("No candidates passed scoring gates")
+        return
+
+    # Sort by score descending
     scored.sort(key=lambda x: x[0], reverse=True)
-    top = scored[:_TOP_N]
-    top_addresses = {d["address"] for _, d in top}
+
+    top_watching = scored[:_WATCHING_N]
+    top_active_addresses = {d["address"] for _, d in scored[:_ACTIVE_N]}
+    top_watching_addresses = {d["address"] for _, d in top_watching}
 
     async with get_session() as session:
         trader_repo = TraderRepo(session)
         snapshot_repo = TraderSnapshotRepo(session)
 
-        # Downgrade existing active traders not in new top N
-        existing = await trader_repo.get_active()
+        # Downgrade existing active/watching traders no longer in our sets
+        existing = await trader_repo.get_all()
         for t in existing:
-            if t.address not in top_addresses:
-                logger.info("Downgrading trader %s to watching", t.address)
-                await trader_repo.update_status(t.id, "watching")
+            if t.address not in top_watching_addresses and t.status != "inactive":
+                logger.info("Downgrading trader %s to inactive (dropped from ranking)", t.address)
+                await trader_repo.update_status(t.id, "inactive")
 
-        # Upsert new top traders
-        for score, data in top:
+        # Upsert all top traders
+        for score, data in top_watching:
+            new_status = "active" if data["address"] in top_active_addresses else "watching"
             trader = await trader_repo.upsert(
                 address=data["address"],
                 display_name=data.get("display_name"),
                 score=score,
-                status="active",
-                category_strengths=data.get("category_strengths"),
+                status=new_status,
+                category_strengths=None,  # Computed lazily
                 total_pnl=data.get("total_pnl", 0.0),
                 monthly_pnl_history=data.get("monthly_pnl_history"),
                 trade_count=data.get("trade_count", 0),
@@ -346,20 +383,31 @@ async def discover_top_traders() -> None:
                 date=datetime.now(timezone.utc).date(),
                 score=score,
                 pnl_30d=data.get("total_pnl"),
-                categories_json=data.get("category_strengths"),
+                categories_json=None,
             )
-            logger.info("Upserted trader %s score=%.3f", data["address"], score)
 
-    logger.info("Discovery complete. Stored %d active traders", len(top))
+    active_count = len([s for s, d in top_watching if d["address"] in top_active_addresses])
+    watching_count = len(top_watching) - active_count
+    logger.info(
+        "Discovery complete: %d active (will be polled), %d watching (scored, not polled)",
+        active_count, watching_count,
+    )
+
+    # Log top 10 for visibility
+    for i, (score, data) in enumerate(scored[:10], 1):
+        name = data.get("display_name") or data["address"][:12]
+        logger.info(
+            "  #%d %s — score=%.3f trades=%d pnl=$%.0f",
+            i, name, score, data["trade_count"], data["total_pnl"],
+        )
 
 
 async def refresh_tracked_traders() -> None:
     """
-    Weekly re-score all tracked traders and swap out underperformers.
+    Weekly re-score all tracked traders and rotate active/watching.
 
-    Re-scores each active/watching trader. Traders scoring below
-    _SCORE_THRESHOLD are deactivated. If active trader count drops
-    below _TOP_N, triggers a fresh discovery run.
+    Re-scores each trader, promotes/demotes based on current performance.
+    Runs a fresh discovery if active count drops below half of _ACTIVE_N.
     """
     logger.info("Refreshing tracked traders")
 
@@ -367,56 +415,69 @@ async def refresh_tracked_traders() -> None:
         trader_repo = TraderRepo(session)
         all_traders = await trader_repo.get_all()
 
-    updated_scores: list[tuple[Trader, float]] = []
+    updated: list[tuple[Trader, float]] = []
 
-    for trader in all_traders:
+    async def rescore(trader: Trader) -> None:
         try:
             async with DataApiClient() as data_client:
-                trades = await data_client.get_trades(user=trader.address, limit=200)
-            monthly_history = await _build_monthly_pnl_history(trades)
-            category_strengths = await compute_category_strengths(trader.address)
-            trades_per_month = len(trades) / max(len(monthly_history), 1)
+                trades = await data_client.get_trades(user=trader.address, limit=500)
+            if len(trades) < _MIN_TRADES:
+                updated.append((trader, 0.0))
+                return
 
+            monthly_history = await _build_monthly_pnl_history(trades)
             last_trade_ts: Optional[datetime] = None
             if trades:
                 ts_raw = trades[0].get("timestamp")
                 if ts_raw:
                     if isinstance(ts_raw, (int, float)):
-                        last_trade_ts = datetime.fromtimestamp(ts_raw, tz=timezone.utc)
+                        last_trade_ts = datetime.fromtimestamp(float(ts_raw), tz=timezone.utc)
                     else:
                         last_trade_ts = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00"))
 
             score = compute_composite_score(
                 monthly_pnl_history=monthly_history,
-                category_strengths=category_strengths,
-                trades_per_month=trades_per_month,
+                trade_count=len(trades),
                 last_active_at=last_trade_ts,
             )
-            updated_scores.append((trader, score))
+            updated.append((trader, score))
         except Exception as exc:
-            logger.warning("Failed to re-score trader %s: %s", trader.address, exc)
+            logger.warning("Failed to re-score %s: %s", trader.address, exc)
+
+    semaphore = asyncio.Semaphore(5)
+
+    async def rescore_with_sem(t: Trader) -> None:
+        async with semaphore:
+            await rescore(t)
+            await asyncio.sleep(0.1)
+
+    await asyncio.gather(*[rescore_with_sem(t) for t in all_traders])
+
+    # Sort by new score, assign statuses
+    updated.sort(key=lambda x: x[1], reverse=True)
+    active_addresses = {t.address for t, _ in updated[:_ACTIVE_N]}
+    watching_addresses = {t.address for t, _ in updated[_ACTIVE_N:_WATCHING_N]}
 
     async with get_session() as session:
         trader_repo = TraderRepo(session)
         snapshot_repo = TraderSnapshotRepo(session)
         active_count = 0
 
-        for trader, score in updated_scores:
-            new_status = trader.status
-            if score < _SCORE_THRESHOLD and trader.status == "active":
-                new_status = "watching"
-                logger.info(
-                    "Downgrading trader %s (score %.3f < threshold %.3f)",
-                    trader.address,
-                    score,
-                    _SCORE_THRESHOLD,
-                )
-            elif score >= _SCORE_THRESHOLD and trader.status != "inactive":
+        for trader, score in updated:
+            if trader.address in active_addresses and score >= _SCORE_THRESHOLD:
                 new_status = "active"
                 active_count += 1
+            elif trader.address in watching_addresses:
+                new_status = "watching"
+            else:
+                new_status = "inactive"
 
             await trader_repo.update_score(trader.id, score)
             if new_status != trader.status:
+                logger.info(
+                    "Trader %s: %s → %s (score=%.3f)",
+                    trader.address[:12], trader.status, new_status, score,
+                )
                 await trader_repo.update_status(trader.id, new_status)
 
             await snapshot_repo.create(
@@ -425,9 +486,8 @@ async def refresh_tracked_traders() -> None:
                 score=score,
             )
 
-    # If we have too few active traders, run discovery again
-    if active_count < _TOP_N // 2:
-        logger.info("Too few active traders (%d), running discovery", active_count)
+    if active_count < _ACTIVE_N // 2:
+        logger.info("Active traders dropped to %d — triggering fresh discovery", active_count)
         await discover_top_traders()
     else:
-        logger.info("Refresh complete. %d active traders", active_count)
+        logger.info("Refresh complete: %d active, %d total tracked", active_count, len(updated))

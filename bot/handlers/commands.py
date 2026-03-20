@@ -237,33 +237,40 @@ async def cmd_traders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def _send_traders_page(update: Update, page: int) -> None:
-    """Send a page of tracked traders."""
+    """Send a page of tracked traders (active first, then watching)."""
     async with get_session() as session:
         trader_repo = TraderRepo(session)
         traders = list(await trader_repo.get_all())
 
     if not traders:
-        await update.message.reply_text("No traders tracked yet.")
+        await update.message.reply_text("No traders tracked yet. Discovery may still be running.")
         return
+
+    active = [t for t in traders if t.status == "active"]
+    watching = [t for t in traders if t.status == "watching"]
+    inactive = [t for t in traders if t.status == "inactive"]
 
     total_pages = max(1, (len(traders) + _TRADERS_PER_PAGE - 1) // _TRADERS_PER_PAGE)
     start = (page - 1) * _TRADERS_PER_PAGE
     page_traders = traders[start : start + _TRADERS_PER_PAGE]
 
-    lines = [f"👥 <b>Tracked Traders</b> (page {page}/{total_pages})\n"]
+    lines = [
+        f"👥 <b>Tracked Traders</b> (page {page}/{total_pages})\n"
+        f"🟢 {len(active)} active (monitored) · 🟡 {len(watching)} watching · 🔴 {len(inactive)} inactive\n"
+    ]
     for i, trader in enumerate(page_traders, start=start + 1):
         name = trader.display_name or (trader.address[:10] + "...")
-        top_category = ""
-        if trader.category_strengths:
-            top_cat = max(trader.category_strengths, key=lambda k: trader.category_strengths[k])
-            top_category = f" [{top_cat}]"
         status_icon = {"active": "🟢", "watching": "🟡", "inactive": "🔴"}.get(trader.status, "⚪")
         monthly = trader.monthly_pnl_history or []
+        # 30d PnL: last month's cash flow
         pnl_30d = sum(m.get("pnl", 0) for m in monthly[-1:]) if monthly else trader.total_pnl
         sign = "+" if pnl_30d >= 0 else ""
+        # Consistency: profitable months / total months
+        profitable_months = sum(1 for m in monthly[-6:] if m.get("pnl", 0) > 0)
+        consistency = f"{profitable_months}/6mo" if len(monthly) >= 3 else "new"
         lines.append(
-            f"{i}. {status_icon} <b>{name}</b>{top_category}\n"
-            f"   Score: {trader.score:.3f} | 30d PnL: {sign}${pnl_30d:.2f}"
+            f"{i}. {status_icon} <b>{name}</b>\n"
+            f"   Score: {trader.score:.3f} | Consistency: {consistency} | Trades: {trader.trade_count}"
         )
 
     keyboard = traders_keyboard(page, total_pages)
