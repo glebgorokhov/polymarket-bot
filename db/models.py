@@ -43,7 +43,11 @@ class Trader(Base):
     category_strengths: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
     total_pnl: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     monthly_pnl_history: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True)
+    weekly_pnl_history: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True)
     trade_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    win_rate: Mapped[Optional[float]] = mapped_column(Float, nullable=True)          # fraction of weeks profitable
+    avg_trades_per_week: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    avg_profit_per_trade: Mapped[Optional[float]] = mapped_column(Float, nullable=True)  # avg cash flow per trade
     first_seen_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     last_active_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     added_at: Mapped[datetime] = mapped_column(

@@ -52,7 +52,11 @@ class TraderRepo:
         category_strengths: Optional[dict] = None,
         total_pnl: float = 0.0,
         monthly_pnl_history: Optional[list] = None,
+        weekly_pnl_history: Optional[list] = None,
         trade_count: int = 0,
+        win_rate: Optional[float] = None,
+        avg_trades_per_week: Optional[float] = None,
+        avg_profit_per_trade: Optional[float] = None,
         first_seen_at: Optional[datetime] = None,
         last_active_at: Optional[datetime] = None,
     ) -> Trader:
@@ -67,7 +71,11 @@ class TraderRepo:
                 category_strengths=category_strengths,
                 total_pnl=total_pnl,
                 monthly_pnl_history=monthly_pnl_history,
+                weekly_pnl_history=weekly_pnl_history,
                 trade_count=trade_count,
+                win_rate=win_rate,
+                avg_trades_per_week=avg_trades_per_week,
+                avg_profit_per_trade=avg_profit_per_trade,
                 first_seen_at=first_seen_at,
                 last_active_at=last_active_at,
             )
@@ -82,7 +90,15 @@ class TraderRepo:
             trader.total_pnl = total_pnl
             if monthly_pnl_history is not None:
                 trader.monthly_pnl_history = monthly_pnl_history
+            if weekly_pnl_history is not None:
+                trader.weekly_pnl_history = weekly_pnl_history
             trader.trade_count = trade_count
+            if win_rate is not None:
+                trader.win_rate = win_rate
+            if avg_trades_per_week is not None:
+                trader.avg_trades_per_week = avg_trades_per_week
+            if avg_profit_per_trade is not None:
+                trader.avg_profit_per_trade = avg_profit_per_trade
             if first_seen_at is not None:
                 trader.first_seen_at = first_seen_at
             if last_active_at is not None:

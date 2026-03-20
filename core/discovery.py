@@ -188,6 +188,26 @@ def compute_composite_score(
     return round(score, 4)
 
 
+def _parse_trade_ts(trade: dict) -> Optional[datetime]:
+    """Parse trade timestamp (Unix int or ISO string) to UTC datetime."""
+    ts_raw = trade.get("timestamp")
+    if not ts_raw:
+        return None
+    try:
+        if isinstance(ts_raw, (int, float)):
+            return datetime.fromtimestamp(float(ts_raw), tz=timezone.utc)
+        return datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+
+def _compute_trade_cash_flow(trade: dict) -> float:
+    size = float(trade.get("size", 0) or 0)
+    price = float(trade.get("price", 0) or 0)
+    side = trade.get("side", "").upper()
+    return size * price if side == "SELL" else -(size * price)
+
+
 async def _build_monthly_pnl_history(trades: list[dict]) -> list[dict]:
     """
     Aggregate trades into monthly cash-flow records.
@@ -197,24 +217,55 @@ async def _build_monthly_pnl_history(trades: list[dict]) -> list[dict]:
     """
     monthly: dict[str, float] = {}
     for trade in trades:
-        ts_raw = trade.get("timestamp")
-        if not ts_raw:
+        ts = _parse_trade_ts(trade)
+        if not ts:
             continue
-        try:
-            if isinstance(ts_raw, (int, float)):
-                ts = datetime.fromtimestamp(float(ts_raw), tz=timezone.utc)
-            else:
-                ts = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00"))
-            key = ts.strftime("%Y-%m")
-            size = float(trade.get("size", 0) or 0)
-            price = float(trade.get("price", 0) or 0)
-            side = trade.get("side", "").upper()
-            # Sells add value, buys subtract — rough but consistent proxy
-            cash_flow = size * price if side == "SELL" else -(size * price)
-            monthly[key] = monthly.get(key, 0.0) + cash_flow
-        except (ValueError, TypeError):
-            continue
+        key = ts.strftime("%Y-%m")
+        monthly[key] = monthly.get(key, 0.0) + _compute_trade_cash_flow(trade)
     return [{"month": k, "pnl": v} for k, v in sorted(monthly.items())]
+
+
+async def _build_weekly_pnl_history(trades: list[dict]) -> list[dict]:
+    """Aggregate trades into weekly cash-flow records (ISO week YYYY-WW)."""
+    weekly: dict[str, float] = {}
+    for trade in trades:
+        ts = _parse_trade_ts(trade)
+        if not ts:
+            continue
+        key = ts.strftime("%Y-%W")
+        weekly[key] = weekly.get(key, 0.0) + _compute_trade_cash_flow(trade)
+    return [{"week": k, "pnl": v} for k, v in sorted(weekly.items())]
+
+
+def _compute_extra_stats(
+    trades: list[dict],
+    weekly_history: list[dict],
+) -> dict:
+    """
+    Compute win_rate, avg_trades_per_week, avg_profit_per_trade from raw trades.
+
+    Returns dict with: win_rate, avg_trades_per_week, avg_profit_per_trade
+    """
+    if not trades or not weekly_history:
+        return {"win_rate": 0.0, "avg_trades_per_week": 0.0, "avg_profit_per_trade": 0.0}
+
+    # Win rate: fraction of weeks with positive net cash flow
+    profitable_weeks = sum(1 for w in weekly_history if w.get("pnl", 0) > 0)
+    win_rate = profitable_weeks / len(weekly_history) if weekly_history else 0.0
+
+    # Active weeks (weeks with any trades)
+    active_weeks = len(weekly_history)
+    avg_trades_per_week = len(trades) / max(active_weeks, 1)
+
+    # Avg profit per trade = total net cash flow / trade count
+    total_cf = sum(_compute_trade_cash_flow(t) for t in trades)
+    avg_profit_per_trade = total_cf / len(trades) if trades else 0.0
+
+    return {
+        "win_rate": round(win_rate, 3),
+        "avg_trades_per_week": round(avg_trades_per_week, 1),
+        "avg_profit_per_trade": round(avg_profit_per_trade, 2),
+    }
 
 
 async def _fetch_all_leaderboard_candidates() -> dict[str, dict]:
@@ -278,14 +329,9 @@ async def _score_candidate(address: str, entry: dict) -> Optional[tuple[float, d
         if len(monthly_history) < _MIN_MONTHS_ACTIVE:
             return None
 
-        last_trade_ts: Optional[datetime] = None
-        if trades:
-            ts_raw = trades[0].get("timestamp")
-            if ts_raw:
-                if isinstance(ts_raw, (int, float)):
-                    last_trade_ts = datetime.fromtimestamp(float(ts_raw), tz=timezone.utc)
-                else:
-                    last_trade_ts = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00"))
+        weekly_history = await _build_weekly_pnl_history(trades)
+        extra_stats = _compute_extra_stats(trades, weekly_history)
+        last_trade_ts = _parse_trade_ts(trades[0]) if trades else None
 
         score = compute_composite_score(
             monthly_pnl_history=monthly_history,
@@ -299,8 +345,10 @@ async def _score_candidate(address: str, entry: dict) -> Optional[tuple[float, d
             "score": score,
             "total_pnl": float(entry.get("pnl", 0) or 0),
             "monthly_pnl_history": monthly_history,
+            "weekly_pnl_history": weekly_history,
             "trade_count": len(trades),
             "last_active_at": last_trade_ts,
+            **extra_stats,
         })
     except Exception as exc:
         logger.debug("Failed to score candidate %s: %s", address, exc)
@@ -379,10 +427,14 @@ async def discover_top_traders() -> None:
                 display_name=data.get("display_name"),
                 score=score,
                 status=new_status,
-                category_strengths=None,  # Computed lazily
+                category_strengths=None,
                 total_pnl=data.get("total_pnl", 0.0),
                 monthly_pnl_history=data.get("monthly_pnl_history"),
+                weekly_pnl_history=data.get("weekly_pnl_history"),
                 trade_count=data.get("trade_count", 0),
+                win_rate=data.get("win_rate"),
+                avg_trades_per_week=data.get("avg_trades_per_week"),
+                avg_profit_per_trade=data.get("avg_profit_per_trade"),
                 last_active_at=data.get("last_active_at"),
             )
             await snapshot_repo.create(

@@ -227,6 +227,63 @@ async def cmd_maxtrade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(f"🔒 Max trade size set to ${amount:.2f}")
 
 
+def _format_trader_card(trader) -> str:
+    """Format a rich trader card with heatmap and stats."""
+    name = trader.display_name or trader.address[:14] + "…"
+    profile_url = f"https://polymarket.com/profile/{trader.address}"
+    status_icon = {"active": "🟢", "watching": "🟡", "inactive": "🔴"}.get(trader.status, "⚪")
+
+    # 30-week heatmap: 🟩 profitable, 🟥 losing, ⬜ no activity
+    weekly = trader.weekly_pnl_history or []
+    recent_30 = weekly[-30:] if len(weekly) >= 30 else weekly
+    squares = []
+    for w in recent_30:
+        pnl = w.get("pnl", 0)
+        if pnl > 2:
+            squares.append("🟩")
+        elif pnl < -2:
+            squares.append("🟥")
+        else:
+            squares.append("⬜️")
+    # Pad with grey on the left if fewer than 30 weeks
+    while len(squares) < 30:
+        squares.insert(0, "⬜️")
+    heatmap = "".join(squares)
+
+    # Consistency: profitable months in last 6
+    monthly = trader.monthly_pnl_history or []
+    profitable_m = sum(1 for m in monthly[-6:] if m.get("pnl", 0) > 0)
+    total_m = min(len(monthly), 6)
+    consistency = f"{profitable_m}/{total_m}mo" if total_m >= 2 else "new"
+
+    # Stats
+    win_rate = f"{trader.win_rate * 100:.0f}%" if trader.win_rate is not None else "—"
+    trades_per_week = f"{trader.avg_trades_per_week:.1f}/wk" if trader.avg_trades_per_week is not None else "—"
+    avg_profit = trader.avg_profit_per_trade
+    profit_str = (
+        f"{'+' if avg_profit >= 0 else ''}${avg_profit:.2f}/trade"
+        if avg_profit is not None else "—"
+    )
+
+    # Last active
+    if trader.last_active_at:
+        from datetime import timezone as tz
+        days_ago = (datetime.now(tz.utc) - trader.last_active_at.replace(tzinfo=tz.utc)
+                    if trader.last_active_at.tzinfo is None
+                    else datetime.now(tz.utc) - trader.last_active_at).days
+        last_active = f"{days_ago}d ago" if days_ago > 0 else "today"
+    else:
+        last_active = "—"
+
+    return (
+        f"{status_icon} <b><a href=\"{profile_url}\">{name}</a></b>  "
+        f"Score: <b>{trader.score:.3f}</b>\n"
+        f"📊 {trader.trade_count:,} trades · {trades_per_week} · last active {last_active}\n"
+        f"🏆 Win rate: {win_rate} · Consistency: {consistency} · Avg: {profit_str}\n"
+        f"{heatmap}"
+    )
+
+
 async def cmd_traders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Handle /traders. Paginated list of tracked traders with score, top category, 30d PnL.
@@ -258,18 +315,9 @@ async def _send_traders_page(update: Update, page: int) -> None:
         f"👥 <b>Tracked Traders</b> — page {page}/{total_pages}\n"
         f"🟢 {len(active)} monitored  🟡 {len(watching)} watching  🔴 {len(inactive)} inactive\n"
     ]
-    for i, trader in enumerate(page_traders, start=start + 1):
-        name = trader.display_name or trader.address[:12] + "…"
-        status_icon = {"active": "🟢", "watching": "🟡", "inactive": "🔴"}.get(trader.status, "⚪")
-        monthly = trader.monthly_pnl_history or []
-        profitable_months = sum(1 for m in monthly[-6:] if m.get("pnl", 0) > 0)
-        total_months = min(len(monthly), 6)
-        consistency = f"{profitable_months}/{total_months}mo" if total_months >= 2 else "new"
-        profile_url = f"https://polymarket.com/profile/{trader.address}"
-        lines.append(
-            f"{status_icon} <b><a href=\"{profile_url}\">{name}</a></b>\n"
-            f"    Score <b>{trader.score:.3f}</b> · {consistency} consistent · {trader.trade_count:,} trades"
-        )
+    for trader in page_traders:
+        lines.append(_format_trader_card(trader))
+        lines.append("")  # spacing between cards
 
     keyboard = traders_keyboard(page, total_pages)
     text = "\n".join(lines)
