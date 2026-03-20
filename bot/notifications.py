@@ -108,7 +108,10 @@ def signal_detected_manual(
     if market_name and len(market_name) > 65:
         short_name += "…"
 
-    trader_line = f"👤 <b>{trader_name}</b>\n" if trader_name else ""
+    if trader_name:
+        trader_line = f"👤 {trader_name}\n"
+    else:
+        trader_line = ""
 
     return (
         f"🚨 <b>Signal — action needed</b>\n"
@@ -223,7 +226,10 @@ def signal_detected(
     # Build polymarket link from eventSlug if we have conditionId
     market_url = f"https://polymarket.com/event/{cond_id}" if cond_id else ""
 
-    lines = [f"{icon} <b>Signal from {name}</b>"]
+    addr = getattr(signal, "_trader_address", "") or ""
+    trader_link = f'<a href="https://polymarket.com/profile/{addr}">{name}</a>' if addr else f"<b>{name}</b>"
+
+    lines = [f"{icon} Signal from {trader_link}"]
     if market_url:
         lines.append(f"🏪 <a href=\"{market_url}\">{market_display}</a>")
     else:

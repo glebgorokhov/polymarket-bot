@@ -208,6 +208,12 @@ async def poll_all_traders() -> None:
                 first_trade.get("id", first_trade.get("transactionHash", ""))
             )
 
+            # On first poll (last_id was None): just set the watermark, don't process.
+            # This avoids flooding notifications with stale trades from before bot start.
+            if last_id is None:
+                logger.debug("First poll for trader %s — watermark set, skipping processing", trader.address[:16])
+                continue
+
             for trade in new_trades:
                 await _process_trade(
                     trade=trade,
@@ -330,6 +336,7 @@ async def _process_trade(
             await signal_repo.update_action(signal.id, "skipped", skip_reason)
 
         # Notify via bot
+        signal._trader_address = trader.address  # type: ignore[attr-defined]
         from bot.notifications import signal_detected
         from bot import notifications as notif
         await notif.send_notification(signal_detected(
@@ -341,9 +348,10 @@ async def _process_trade(
         ))
         return
 
-    # Enrich signal with market category for CategoryExpert strategy
+    # Enrich signal with extra context for executor + notifications
     signal.market_category = market_category  # type: ignore[attr-defined]
     signal.trader = trader  # type: ignore[attr-defined]
+    signal._trader_address = trader.address  # type: ignore[attr-defined]
 
     # Hand off to executor
     from core import executor

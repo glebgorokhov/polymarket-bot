@@ -136,11 +136,14 @@ async def execute_copy_trade(signal: Signal, mode: str) -> None:
         async with get_session() as session:
             await SignalRepo(session).update_action(signal.id, "manual")
         from bot.notifications import signal_detected_manual, send_notification
-        trader_name = getattr(signal, "trader", None)
-        trader_display = (trader_name.display_name if trader_name else None) or None
+        _trader = getattr(signal, "trader", None)
+        _trader_addr = getattr(signal, "_trader_address", None) or (getattr(_trader, "address", None) if _trader else None)
+        _trader_display = (getattr(_trader, "display_name", None) if _trader else None)
+        if _trader_display and _trader_addr:
+            _trader_display = f'<a href="https://polymarket.com/profile/{_trader_addr}">{_trader_display}</a>'
         await send_notification(signal_detected_manual(
             signal, triggered_slugs, market_name,
-            trader_name=trader_display,
+            trader_name=_trader_display,
         ))
         return
 
