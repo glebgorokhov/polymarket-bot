@@ -27,8 +27,10 @@ _ACTIVE_SCORE_THRESHOLD = 0.55  # Score needed to be actively monitored (polled 
 _WATCHING_N = 500               # Max stored in DB for scoring/reference
 _SCORE_THRESHOLD = 0.30         # Minimum score to stay in DB at all
 _MIN_TRADES = 30                # Require at least 30 total trades
-_MIN_MONTHS_ACTIVE = 3          # Require at least 3 months of history
-# No VIP bypass — everyone must pass the same gates. Short history = lucky bet, not a pattern.
+_MIN_MONTHS_ACTIVE = 2          # Require at least 2 months (lowered — some great traders start fast)
+_MIN_POSITIONS_FOR_WIN_RATE = 10  # Need at least 10 resolved positions to compute meaningful win rate
+# Win rate is computed from positions API (realizedPnl > 0 per position) — NOT trade cash flow.
+# Cash flow is a broken proxy: hold-to-resolution traders show 0% because payouts bypass the trades API.
 
 # All Polymarket categories to pull from
 _CATEGORIES = [
@@ -145,6 +147,7 @@ def compute_composite_score(
     trade_count: int,
     last_active_at: Optional[datetime],
     weekly_pnl_history: Optional[list] = None,
+    position_win_rate: Optional[float] = None,
 ) -> float:
     """
     Composite trader quality score. Primary metric: weekly win rate.
@@ -182,19 +185,24 @@ def compute_composite_score(
     if recency_mult == 0.0:
         return 0.0
 
-    # Weekly win rate — fraction of weeks with positive PnL
-    weekly = weekly_pnl_history or []
-    if weekly:
-        profitable_weeks = sum(1 for w in weekly if w.get("pnl", 0) > 2)
-        win_rate = profitable_weeks / len(weekly)
+    # Win rate: use real position win rate if provided, else fall back to weekly cash flow
+    # NOTE: cash flow is a broken proxy for hold-to-resolution traders. Position-level is ground truth.
+    if position_win_rate is not None and position_win_rate >= 0:
+        win_rate = position_win_rate
     else:
-        # Fallback to monthly consistency if no weekly data
-        profitable_months = sum(1 for m in monthly_pnl_history[-6:] if m.get("pnl", 0) > 0)
-        win_rate = profitable_months / max(len(monthly_pnl_history[-6:]), 1)
+        weekly = weekly_pnl_history or []
+        if weekly:
+            profitable_weeks = sum(1 for w in weekly if w.get("pnl", 0) > 2)
+            win_rate = profitable_weeks / len(weekly)
+        else:
+            profitable_months = sum(1 for m in monthly_pnl_history[-6:] if m.get("pnl", 0) > 0)
+            win_rate = profitable_months / max(len(monthly_pnl_history[-6:]), 1)
 
-    # Hard gates on win rate AND monthly consistency
-    if win_rate < 0.50:
-        return 0.0  # Below 50% weekly win rate = no edge, not worth tracking
+    weekly = weekly_pnl_history or []
+
+    # Hard gate: ≥60% win rate required — Gleb's target is 80%, 60% is the floor
+    if win_rate < 0.60:
+        return 0.0
 
     monthly_profitable = sum(1 for m in monthly_pnl_history[-6:] if m.get("pnl", 0) > 0)
     total_recent_months = min(len(monthly_pnl_history), 6)
@@ -258,6 +266,31 @@ def _compute_trade_cash_flow(trade: dict) -> float:
     price = float(trade.get("price", 0) or 0)
     side = trade.get("side", "").upper()
     return size * price if side == "SELL" else -(size * price)
+
+
+def _compute_position_win_rate(positions: list[dict]) -> float:
+    """
+    Compute win rate from positions API using realizedPnl per position.
+    Only counts positions that have resolved (currentValue ≈ 0, redeemable=False).
+
+    This is the TRUE win rate — how many distinct market bets they won.
+    Much more accurate than weekly cash flow (which misses hold-to-resolution payouts).
+    """
+    wins = 0
+    losses = 0
+    for p in positions:
+        current_value = float(p.get("currentValue", 0) or 0)
+        realized_pnl = float(p.get("cashPnl", p.get("realizedPnl", 0)) or 0)
+        # Position is closed/resolved if current value is near zero
+        if current_value < 1.0:
+            if realized_pnl > 0:
+                wins += 1
+            else:
+                losses += 1
+    total = wins + losses
+    if total < _MIN_POSITIONS_FOR_WIN_RATE:
+        return -1.0  # Not enough data to compute meaningful win rate
+    return round(wins / total, 3)
 
 
 async def _build_monthly_pnl_history(trades: list[dict]) -> list[dict]:
@@ -378,6 +411,7 @@ async def _score_candidate(address: str, entry: dict) -> Optional[tuple[float, d
     try:
         async with DataApiClient() as data_client:
             trades = await data_client.get_all_trades(user=address)
+            positions = await data_client.get_positions(user=address)
 
         if len(trades) < _MIN_TRADES:
             return None
@@ -387,18 +421,25 @@ async def _score_candidate(address: str, entry: dict) -> Optional[tuple[float, d
             return None
 
         weekly_history = await _build_weekly_pnl_history(trades)
-        extra_stats = _compute_extra_stats(trades, weekly_history)
         last_trade_ts = _parse_trade_ts(trades[0]) if trades else None
 
-        # Hard gate: inactive traders can't be copied
         if _compute_recency_multiplier(last_trade_ts) == 0.0:
-            return None  # >60 days inactive
+            return None
+
+        # Compute REAL win rate from positions API (not cash flow proxy)
+        # cashPnl/percentRealizedPnl on resolved positions is the ground truth
+        real_win_rate = _compute_position_win_rate(positions)
+
+        extra_stats = _compute_extra_stats(trades, weekly_history)
+        # Override win_rate with real value from positions
+        extra_stats["win_rate"] = real_win_rate
 
         score = compute_composite_score(
             monthly_pnl_history=monthly_history,
             trade_count=len(trades),
             last_active_at=last_trade_ts,
             weekly_pnl_history=weekly_history,
+            position_win_rate=real_win_rate,
         )
 
         return (score, {
