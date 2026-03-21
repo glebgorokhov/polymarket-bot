@@ -359,7 +359,7 @@ async def close_position(position: Position, reason: str, exit_price: Optional[f
             await execution_repo.create(
                 position_id=position.id,
                 side="SELL",
-                price=current_price,
+                price=exit_price,
                 size=position.shares,
                 fee=0.0,
             )
