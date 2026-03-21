@@ -373,10 +373,35 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=positions_refresh_keyboard())
 
 
+async def _fetch_clob_market_info(condition_ids: list) -> dict:
+    """Batch fetch market question + outcome names + end_date from CLOB."""
+    import asyncio
+    import httpx
+
+    result = {}
+
+    async def fetch_one(client, cid):
+        try:
+            resp = await client.get(f"https://clob.polymarket.com/markets/{cid}", timeout=8)
+            if resp.status_code == 200:
+                return cid, resp.json()
+        except Exception:
+            pass
+        return cid, None
+
+    async with httpx.AsyncClient() as client:
+        tasks = [fetch_one(client, cid) for cid in condition_ids]
+        pairs = await asyncio.gather(*tasks)
+
+    for cid, data in pairs:
+        if data:
+            result[cid] = data
+    return result
+
+
 async def _build_positions_text() -> str:
     """Build positions summary string (real positions only, shadow count shown separately)."""
-    from collections import defaultdict
-    from db.repos.signals import SignalRepo
+    import asyncio
     from db.repos.traders import TraderRepo
 
     async with get_session() as session:
@@ -384,33 +409,31 @@ async def _build_positions_text() -> str:
         real_positions = list(await position_repo.get_open(is_shadow=False))
         shadow_positions = list(await position_repo.get_open(is_shadow=True))
 
-        # Build a map of market → trader names (from other open positions sharing same market)
-        market_traders: dict[str, list[str]] = defaultdict(list)
-        for pos in real_positions:
+        # Find traders sharing the same market (any open position, real or shadow)
+        from collections import defaultdict
+        market_to_traders: dict[str, set] = defaultdict(set)
+        for pos in list(real_positions) + list(shadow_positions):
             if pos.trader_address:
-                market_traders[pos.market_condition_id].append(pos.trader_address)
+                market_to_traders[pos.market_condition_id].add(pos.trader_address)
 
-        # Also look up which signal traders are in each market (from shadow positions on same market)
-        for pos in shadow_positions:
-            if pos.trader_address and pos.trader_address not in market_traders.get(pos.market_condition_id, []):
-                market_traders[pos.market_condition_id].append(pos.trader_address)
-
-        # Fetch display names for all referenced trader addresses
-        all_addresses = {addr for addrs in market_traders.values() for addr in addrs}
+        # Resolve trader names
+        all_addresses = {a for addrs in market_to_traders.values() for a in addrs}
         trader_names: dict[str, str] = {}
         if all_addresses:
             trader_repo = TraderRepo(session)
             for addr in all_addresses:
                 t = await trader_repo.get_by_address(addr)
-                if t:
-                    trader_names[addr] = t.display_name or addr[:10] + "…"
-                else:
-                    trader_names[addr] = addr[:10] + "…"
+                trader_names[addr] = (t.display_name if t and t.display_name else addr[:10] + "…")
 
     if not real_positions and not shadow_positions:
         return "📂 No open positions."
 
+    # Batch fetch market info from CLOB for all unique condition IDs
+    unique_cids = list({pos.market_condition_id for pos in real_positions})
+    clob_data = await _fetch_clob_market_info(unique_cids)
+
     lines = [f"📂 <b>Open Positions ({len(real_positions)} real)</b>\n"]
+
     for pos in real_positions:
         current = pos.current_price or pos.entry_price
         entry_cost = pos.entry_cost or pos.size_usd
@@ -420,22 +443,42 @@ async def _build_positions_text() -> str:
         sign = "+" if pnl >= 0 else ""
         icon = "🟢" if pnl >= 0 else "🔴"
 
-        # Market question (full name, then truncate)
-        market_short = pos.market_name[:55] + "…" if len(pos.market_name) > 55 else pos.market_name
+        # ── Market question ──────────────────────────────────────────────────
+        clob = clob_data.get(pos.market_condition_id) or {}
+        question = clob.get("question") or pos.market_name or pos.market_condition_id
+        # If market_name is a 0x hex (old style), prefer CLOB question
+        if pos.market_name and pos.market_name.startswith("0x"):
+            question = clob.get("question") or pos.market_condition_id[:20] + "…"
+        market_short = question[:60] + "…" if len(question) > 60 else question
 
-        # Outcome: what did we bet on?
-        outcome_str = f" [{pos.outcome}]" if pos.outcome else ""
+        # ── Outcome (YES / NO / name) ────────────────────────────────────────
+        outcome = pos.outcome  # populated for new positions
+        if not outcome and clob:
+            # Figure out from token_id which outcome this is
+            tokens = clob.get("tokens") or []
+            for tok in tokens:
+                if tok.get("token_id") == pos.token_id:
+                    outcome = tok.get("outcome")
+                    break
+        outcome_str = f" → <b>{outcome}</b>" if outcome else ""
 
-        # Close date
-        if pos.end_date:
-            now = datetime.now(timezone.utc)
-            end = pos.end_date
-            if end.tzinfo is None:
-                from datetime import timezone as _tz
-                end = end.replace(tzinfo=_tz.utc)
-            days_left = (end - now).days
+        # ── Close date ───────────────────────────────────────────────────────
+        end_date = pos.end_date
+        if not end_date and clob:
+            raw_end = clob.get("end_date_iso") or clob.get("end_date")
+            if raw_end:
+                try:
+                    end_date = datetime.fromisoformat(raw_end.replace("Z", "+00:00"))
+                except Exception:
+                    pass
+
+        if end_date:
+            now_utc = datetime.now(timezone.utc)
+            if end_date.tzinfo is None:
+                end_date = end_date.replace(tzinfo=timezone.utc)
+            days_left = (end_date - now_utc).days
             if days_left < 0:
-                close_str = "⚠️ resolved"
+                close_str = "⚠️ may have resolved"
             elif days_left == 0:
                 close_str = "closes today"
             elif days_left == 1:
@@ -445,34 +488,30 @@ async def _build_positions_text() -> str:
         else:
             close_str = ""
 
-        # Which traders are on this market
-        addrs = market_traders.get(pos.market_condition_id, [])
-        traders_on_market = [trader_names[a] for a in addrs if a in trader_names]
-        traders_str = f" · traders: {', '.join(traders_on_market)}" if traders_on_market else ""
+        # ── Traders on this market ────────────────────────────────────────────
+        addrs = market_to_traders.get(pos.market_condition_id, set())
+        traders_list = [trader_names[a] for a in addrs if a in trader_names]
+        traders_str = "traders: " + ", ".join(traders_list) if traders_list else ""
 
-        # Entry cost and current value
-        cost_str = f"${entry_cost:.2f} in" if entry_cost else ""
-
+        # ── Format line ───────────────────────────────────────────────────────
+        cost_str = f"${entry_cost:.2f}" if entry_cost else "?"
         line = (
             f"{icon} <b>{market_short}</b>\n"
             f"   {pos.side}{outcome_str} @ {pos.entry_price:.4f}"
-            f" | {cost_str} → <b>${current_value:.2f}</b> ({sign}{pnl_pct:.1f}%)"
+            f" · {cost_str} → <b>${current_value:.2f}</b> ({sign}{pnl_pct:.1f}%)"
         )
         if close_str:
             line += f" · {close_str}"
         if traders_str:
-            line += f"\n  {traders_str}"
+            line += f"\n   👤 {traders_str}"
 
         lines.append(line)
 
     if shadow_positions:
-        # Group shadow positions by strategy for a cleaner summary
         from collections import Counter
-        strat_counts: Counter = Counter()
-        for p in shadow_positions:
-            strat_counts[p.strategy_id or 0] += 1
+        strat_counts: Counter = Counter(p.strategy_id for p in shadow_positions)
         total = len(shadow_positions)
-        lines.append(f"\n👁️ <i>{total} shadow simulation position(s) running (strategy comparison)</i>")
+        lines.append(f"\n👁️ <i>{total} shadow positions (strategy A/B testing — not real money)</i>")
 
     return "\n".join(lines)
 
@@ -1232,6 +1271,42 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/feed — Recent trades by top traders\n"
         "/report — Generate full report\n"
         "/settings — Show all settings\n"
+        "/cleanshadows — Delete all open shadow positions\n"
         "/help — This message"
     )
     await update.message.reply_text(help_text, parse_mode="HTML")
+
+
+async def cmd_cleanshadows(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handle /cleanshadows. Wipes all open shadow positions from the DB.
+    Shadow positions are simulation-only — this is safe to run anytime.
+    """
+    if not _is_admin(update):
+        return
+    from sqlalchemy import update as sa_update
+    from db.models import Position as PositionModel
+    from db.session import get_session as _gs
+
+    async with _gs() as session:
+        from sqlalchemy import select, delete
+        from db.models import Position as _Pos
+        # Count first
+        count_q = await session.execute(
+            select(_Pos).where(_Pos.status == "open", _Pos.is_shadow == True)
+        )
+        count = len(count_q.scalars().all())
+
+        # Delete them
+        await session.execute(
+            __import__("sqlalchemy").delete(_Pos).where(
+                _Pos.status == "open", _Pos.is_shadow == True
+            )
+        )
+        await session.commit()
+
+    await update.message.reply_text(
+        f"🧹 Deleted <b>{count}</b> open shadow positions.\n"
+        f"Shadow tracking will restart fresh from next signal.",
+        parse_mode="HTML",
+    )

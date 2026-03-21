@@ -10,6 +10,7 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler  # no
 from bot.handlers.callbacks import handle_callback
 from bot.handlers.commands import (
     cmd_budget,
+    cmd_cleanshadows,
     cmd_discover,
     cmd_feed,
     cmd_help,
@@ -71,6 +72,7 @@ def create_app() -> Application:
     app.add_handler(CommandHandler("untrack", cmd_untrack))
     app.add_handler(CommandHandler("discover", cmd_discover))
     app.add_handler(CommandHandler("simulate", cmd_simulate))
+    app.add_handler(CommandHandler("cleanshadows", cmd_cleanshadows))
     app.add_handler(CommandHandler("help", cmd_help))
 
     # Register inline callback handler
