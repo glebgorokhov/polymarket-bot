@@ -4,8 +4,13 @@ Handles copying trades, closing positions, stop-loss checks, and price updates.
 """
 
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Any, Optional
+
+# Cooldown tracker: suppress repeated risk alerts for the same reason
+_risk_alert_last_sent: dict[str, float] = {}
+_RISK_ALERT_COOLDOWN_SEC = 900  # 15 minutes
 
 from api.clob import ClobApiClient
 from api.gamma import GammaApiClient
@@ -188,8 +193,13 @@ async def execute_copy_trade(signal: Signal, mode: str) -> None:
                 logger.info("Risk check failed for primary: %s", risk_reason)
                 async with get_session() as session:
                     await SignalRepo(session).update_action(signal.id, "skipped", f"risk:{risk_reason}")
-                from bot.notifications import risk_alert, send_notification
-                await send_notification(risk_alert("risk_limit", risk_reason))
+                # Rate-limit risk alerts: same reason only fires once per 15 min
+                _reason_key = risk_reason.split("_")[0]  # e.g. "total" from "total_exposure_..."
+                _now = time.time()
+                if _now - _risk_alert_last_sent.get(_reason_key, 0) > _RISK_ALERT_COOLDOWN_SEC:
+                    _risk_alert_last_sent[_reason_key] = _now
+                    from bot.notifications import risk_alert, send_notification
+                    await send_notification(risk_alert("risk_limit", risk_reason))
                 is_primary = False  # fall through as shadow
 
         if is_primary and mode == "auto":
