@@ -204,9 +204,11 @@ async def execute_copy_trade(signal: Signal, mode: str) -> None:
                 shares = trade_size / filled_price if filled_price > 0 else shares
                 logger.info("Order placed: %s %s size=%.2f id=%s result=%s", signal.side, signal.token_id, trade_size, order_id, order_result)
                 # Check if the order actually filled — FOK returns status "matched"/"unmatched"
-                order_status = order_result.get("status", "")
-                if order_status and order_status.lower() not in ("matched", "filled", "mev"):
-                    raise RuntimeError(f"Order not filled: status={order_status} msg={order_result.get('errorMsg', order_result)}")
+                # Valid fill statuses: matched/filled/mev = immediate fill, delayed = queued
+                # Only treat explicit failure statuses as errors
+                order_status = order_result.get("status", "").lower()
+                if order_status in ("unmatched", "cancelled", "canceled"):
+                    raise RuntimeError(f"Order not filled: status={order_status} msg={order_result.get('errorMsg', '')}")
             except Exception as exc:
                 logger.error("Order placement failed: %s", exc)
                 from bot.notifications import error_alert, send_notification
