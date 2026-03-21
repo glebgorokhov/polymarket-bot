@@ -432,92 +432,139 @@ async def _build_positions_text() -> str:
     unique_cids = list({pos.market_condition_id for pos in real_positions})
     clob_data = await _fetch_clob_market_info(unique_cids)
 
-    lines = [f"📂 <b>Open Positions ({len(real_positions)} real)</b>"]
-
-    for pos in real_positions:
-        current = pos.current_price or pos.entry_price
-        entry_cost = pos.entry_cost or pos.size_usd
-        current_value = (pos.shares or 0) * current
-        pnl = current_value - entry_cost
-        pnl_pct = (pnl / entry_cost * 100) if entry_cost > 0 else 0
-        sign = "+" if pnl >= 0 else ""
-        icon = "🟢" if pnl >= 0 else "🔴"
-
-        # ── Market question + URL ────────────────────────────────────────────
-        clob = clob_data.get(pos.market_condition_id) or {}
-        question = clob.get("question") or pos.market_name or ""
+    # ── Helper: resolve market metadata from CLOB ────────────────────────────
+    def _market_meta(cid: str):
+        clob = clob_data.get(cid) or {}
+        question = clob.get("question") or ""
         if not question or question.startswith("0x"):
-            question = pos.market_condition_id[:24] + "…"
-        market_short = question[:65] + "…" if len(question) > 65 else question
-
-        market_slug = clob.get("market_slug") or pos.market_condition_id
-        market_url = f"https://polymarket.com/event/{market_slug}"
-
-        # ── Outcome (YES / NO / name) ────────────────────────────────────────
-        outcome = pos.outcome
-        if not outcome and clob:
-            tokens = clob.get("tokens") or []
-            for tok in tokens:
-                if tok.get("token_id") == pos.token_id:
-                    outcome = tok.get("outcome")
-                    break
-        outcome_str = f" → <b>{outcome}</b>" if outcome else ""
-
-        # ── Close / resolved status ──────────────────────────────────────────
-        # Use CLOB closed flag as ground truth. end_date alone is unreliable.
+            question = cid[:24] + "…"
+        slug = clob.get("market_slug") or cid
+        url = f"https://polymarket.com/event/{slug}"
         is_closed = clob.get("closed", False)
-        if is_closed:
-            close_str = "✅ resolved — close this position"
-        else:
-            end_date = pos.end_date
-            if not end_date:
-                raw_end = clob.get("end_date_iso") or clob.get("end_date")
-                if raw_end:
-                    try:
-                        end_date = datetime.fromisoformat(raw_end.replace("Z", "+00:00"))
-                    except Exception:
-                        pass
-            close_str = ""
-            if end_date:
-                now_utc = datetime.now(timezone.utc)
-                if end_date.tzinfo is None:
-                    end_date = end_date.replace(tzinfo=timezone.utc)
-                days_left = (end_date - now_utc).days
-                if days_left == 0:
-                    close_str = "closes today"
-                elif days_left == 1:
-                    close_str = "closes tomorrow"
-                elif days_left > 1:
-                    close_str = f"closes in {days_left}d"
-                # days_left < 0 but not closed → end_date is stale, show nothing
 
-        # ── Traders on this market ────────────────────────────────────────────
-        addrs = market_to_traders.get(pos.market_condition_id, set())
-        trader_parts = []
+        close_str = ""
+        if is_closed:
+            close_str = "✅ resolved"
+        else:
+            raw_end = clob.get("end_date_iso") or clob.get("end_date")
+            if raw_end:
+                try:
+                    end_dt = datetime.fromisoformat(raw_end.replace("Z", "+00:00"))
+                    if end_dt.tzinfo is None:
+                        end_dt = end_dt.replace(tzinfo=timezone.utc)
+                    days_left = (end_dt - datetime.now(timezone.utc)).days
+                    if days_left == 0:
+                        close_str = "closes today"
+                    elif days_left == 1:
+                        close_str = "closes tomorrow"
+                    elif days_left > 1:
+                        close_str = f"closes in {days_left}d"
+                    # negative but not closed → stale end_date, skip
+                except Exception:
+                    pass
+        return question, url, close_str, is_closed
+
+    def _outcome_for(pos) -> str:
+        clob = clob_data.get(pos.market_condition_id) or {}
+        out = pos.outcome
+        if not out:
+            for tok in (clob.get("tokens") or []):
+                if tok.get("token_id") == pos.token_id:
+                    out = tok.get("outcome")
+                    break
+        return out or ""
+
+    def _trader_links(cid: str) -> str:
+        addrs = market_to_traders.get(cid, set())
+        parts = []
         for addr in addrs:
             name = trader_names.get(addr, addr[:10] + "…")
-            trader_parts.append(f'<a href="https://polymarket.com/profile/{addr}">{name}</a>')
-        traders_str = "👤 " + ", ".join(trader_parts) if trader_parts else ""
+            parts.append(f'<a href="https://polymarket.com/profile/{addr}">{name}</a>')
+        return "👤 " + ", ".join(parts) if parts else ""
 
-        # ── Format block ──────────────────────────────────────────────────────
-        cost_str = f"${entry_cost:.2f}" if entry_cost else "?"
-        meta = f"{cost_str} → <b>${current_value:.2f}</b> ({sign}{pnl_pct:.1f}%)"
-        if close_str:
-            meta += f" · {close_str}"
+    # ── Group positions: market → outcome → [positions] ──────────────────────
+    from collections import defaultdict, OrderedDict
+    # Preserve insertion order (original sort order)
+    market_groups: dict[str, dict[str, list]] = OrderedDict()
+    for pos in real_positions:
+        cid = pos.market_condition_id
+        out = _outcome_for(pos)
+        if cid not in market_groups:
+            market_groups[cid] = OrderedDict()
+        if out not in market_groups[cid]:
+            market_groups[cid][out] = []
+        market_groups[cid][out].append(pos)
 
-        block = (
-            f"\n"
-            f"{icon} <a href=\"{market_url}\"><b>{market_short}</b></a>\n"
-            f"   {pos.side}{outcome_str} @ {pos.entry_price:.4f} · {meta}"
-        )
-        if traders_str:
-            block += f"\n   {traders_str}"
+    total_markets = len(market_groups)
+    total_positions = len(real_positions)
+    header = f"📂 <b>Open Positions</b> — {total_markets} market{'s' if total_markets != 1 else ''}, {total_positions} position{'s' if total_positions != 1 else ''}"
+    lines = [header]
+
+    DIGITS = ["①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨", "⑩"]
+
+    for cid, outcome_groups in market_groups.items():
+        question, market_url, close_str, is_closed = _market_meta(cid)
+        market_title = question[:65] + "…" if len(question) > 65 else question
+
+        # Compute combined P&L across all positions in this market
+        total_cost = 0.0
+        total_value = 0.0
+        for positions_list in outcome_groups.values():
+            for p in positions_list:
+                ec = p.entry_cost or p.size_usd
+                cv = (p.shares or 0) * (p.current_price or p.entry_price)
+                total_cost += ec
+                total_value += cv
+        combined_pnl = total_value - total_cost
+        combined_pnl_pct = (combined_pnl / total_cost * 100) if total_cost > 0 else 0
+        market_icon = "🟢" if combined_pnl >= 0 else "🔴"
+
+        # ── Market header line ────────────────────────────────────────────────
+        close_tag = f" · <i>{close_str}</i>" if close_str else ""
+        block = f"\n{market_icon} <a href=\"{market_url}\"><b>{market_title}</b></a>{close_tag}"
+
+        for outcome_key, positions_list in outcome_groups.items():
+            outcome_label = f"<b>{outcome_key}</b>" if outcome_key else ""
+
+            if len(positions_list) == 1:
+                # ── Single position: compact one-liner ────────────────────────
+                p = positions_list[0]
+                ec = p.entry_cost or p.size_usd
+                cv = (p.shares or 0) * (p.current_price or p.entry_price)
+                pnl_pct = ((cv - ec) / ec * 100) if ec > 0 else 0
+                sign = "+" if pnl_pct >= 0 else ""
+                outcome_str = f" → {outcome_label}" if outcome_label else ""
+                block += f"\n   {p.side}{outcome_str} @ {p.entry_price:.3f} · ${ec:.2f} → <b>${cv:.2f}</b> ({sign}{pnl_pct:.1f}%)"
+            else:
+                # ── Multiple positions: list each, show total ─────────────────
+                side = positions_list[0].side
+                outcome_str = f" → {outcome_label}" if outcome_label else ""
+                block += f"\n   {side}{outcome_str} · {len(positions_list)} entries"
+                for i, p in enumerate(positions_list):
+                    ec = p.entry_cost or p.size_usd
+                    cv = (p.shares or 0) * (p.current_price or p.entry_price)
+                    pnl_pct = ((cv - ec) / ec * 100) if ec > 0 else 0
+                    sign = "+" if pnl_pct >= 0 else ""
+                    digit = DIGITS[i] if i < len(DIGITS) else f"{i+1}."
+                    block += f"\n   {digit} @ {p.entry_price:.3f} · ${ec:.2f} → <b>${cv:.2f}</b> ({sign}{pnl_pct:.1f}%)"
+
+                # Combined total for this outcome group
+                grp_cost = sum((p.entry_cost or p.size_usd) for p in positions_list)
+                grp_val = sum((p.shares or 0) * (p.current_price or p.entry_price) for p in positions_list)
+                grp_pnl_pct = ((grp_val - grp_cost) / grp_cost * 100) if grp_cost > 0 else 0
+                grp_sign = "+" if grp_pnl_pct >= 0 else ""
+                block += f"\n   📊 Total: ${grp_cost:.2f} → <b>${grp_val:.2f}</b> ({grp_sign}{grp_pnl_pct:.1f}%)"
+
+        # ── Traders ───────────────────────────────────────────────────────────
+        tlinks = _trader_links(cid)
+        if tlinks:
+            block += f"\n   {tlinks}"
 
         lines.append(block)
 
     if shadow_positions:
         total = len(shadow_positions)
-        lines.append(f"\n👁️ <i>{total} shadow positions (strategy A/B testing)</i>")
+        lines.append(f"\n👁️ <i>{total} shadow positions (strategy comparison)</i>")
 
     return "\n".join(lines)
 
