@@ -129,14 +129,11 @@ class SignalRepo:
             )
         )
         signals = result.scalars().all()
-        counts: dict = {"detected": len(signals), "copied": 0, "skipped": 0, "manual": 0}
+        counts: dict = {"detected": len(signals), "copied": 0, "paper": 0, "skipped": 0, "manual": 0, "error": 0}
         for s in signals:
-            if s.action_taken == "copied":
-                counts["copied"] += 1
-            elif s.action_taken == "skipped":
-                counts["skipped"] += 1
-            elif s.action_taken == "manual":
-                counts["manual"] += 1
+            action = s.action_taken or ""
+            if action in counts:
+                counts[action] += 1
         return counts
 
     async def get_recent_for_market(
