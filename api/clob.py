@@ -147,8 +147,10 @@ class ClobApiClient:
             params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
             result = client.get_balance_allowance(params)
             if isinstance(result, dict):
-                # returns {"balance": "49.0", "allowance": "..."}
-                return float(result.get("balance", 0))
+                raw = float(result.get("balance", 0))
+                # USDC has 6 decimal places — raw value is in micro-USDC
+                # If value looks like it's in raw units (> 1000x realistic balance), normalize
+                return raw / 1_000_000 if raw > 1000 else raw
             return float(result or 0)
 
         return await self._with_retry(_call)
