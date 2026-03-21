@@ -80,35 +80,26 @@ class ClobApiClient:
                 # signature_type=1 = POLY_PROXY (Magic Link / Google login)
                 # signature_type=2 = GNOSIS_SAFE (MetaMask login — most common)
                 # funder = the proxy wallet address shown on polymarket.com profile
-                creds = None
-                if self._relayer_api_secret and self._relayer_api_passphrase:
-                    creds = ApiCreds(
-                        api_key=self._relayer_api_key,
-                        api_secret=self._relayer_api_secret,
-                        api_passphrase=self._relayer_api_passphrase,
-                    )
-
-                # signature_type=2 (POLY_GNOSIS_SAFE) — EOA signs on behalf of proxy wallet
-                # Used when account was created via MetaMask/Phantom on polymarket.com
-                # funder = proxy wallet address (0x13D4...) that holds USDC
-                # key = EOA private key (Phantom wallet, 0xab4f...) that controls the proxy
+                # Always derive L2 creds fresh from private key — never use stored ones.
+                # Stored creds become stale when the private key changes (e.g. after wallet rotation).
+                # signature_type=2 (POLY_GNOSIS_SAFE) — EOA signs on behalf of proxy wallet.
+                # Used when account was created via MetaMask/Phantom on polymarket.com.
+                # funder = proxy wallet address (0x13D4...) that holds USDC.
+                # key = EOA private key (Phantom wallet) that controls the proxy.
                 self._client = ClobClient(
                     host=self._host,
                     chain_id=self._chain_id,
                     key=self._private_key,
-                    creds=creds,
                     signature_type=2,
                     funder=self._funder_address,
                 )
 
-                # If no L2 creds provided, derive them from the private key
-                if creds is None:
-                    try:
-                        derived = self._client.create_or_derive_api_creds()
-                        self._client.set_api_creds(derived)
-                        logger.info("Derived L2 API credentials from private key")
-                    except Exception as exc:
-                        logger.warning("Could not derive L2 creds: %s — L1-only mode", exc)
+                try:
+                    derived = self._client.create_or_derive_api_creds()
+                    self._client.set_api_creds(derived)
+                    logger.info("Derived fresh L2 API credentials from private key")
+                except Exception as exc:
+                    logger.warning("Could not derive L2 creds: %s — L1-only mode", exc)
             except ImportError as exc:
                 raise RuntimeError(
                     "py-clob-client is not installed. Add it to requirements.txt."
