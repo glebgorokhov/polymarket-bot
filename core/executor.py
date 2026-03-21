@@ -436,16 +436,28 @@ async def check_market_resolutions() -> None:
         # Market is resolved — find if our token won
         tokens = data.get("tokens") or []
         winner = None
+
+        # Primary: match by token_id
         for tok in tokens:
             if tok.get("token_id") == position.token_id:
                 winner = tok.get("winner", False)
                 break
 
+        # Fallback: match by outcome name (covers synced positions where token_id format differs)
+        if winner is None and position.outcome:
+            for tok in tokens:
+                if tok.get("outcome", "").lower() == position.outcome.lower():
+                    winner = tok.get("winner", False)
+                    logger.info(
+                        "Resolution: matched position %d by outcome name %r (token_id mismatch)",
+                        position.id, position.outcome,
+                    )
+                    break
+
         if winner is None:
-            # token_id not found in market tokens — unusual, skip
             logger.warning(
-                "Could not determine winner for position %d token %s",
-                position.id, position.token_id[:20],
+                "Could not determine winner for position %d token %s outcome %r",
+                position.id, (position.token_id or "")[:20], position.outcome,
             )
             continue
 
