@@ -338,23 +338,24 @@ def trade_closed(position: Any, market_question: Optional[str] = None) -> str:
     outcome = getattr(position, "outcome", None)
     outcome_str = f" → <b>{outcome}</b>" if outcome else ""
 
-    reason_map = {
-        "trader_exited": "Trader exited",
-        "market_resolved": "Market resolved",
-    }
     close_reason = position.close_reason or "unknown"
-    if close_reason.startswith("stop_loss_"):
+    if close_reason == "market_resolved":
+        # Show WIN / LOSS prominently
+        result_label = "WIN 🏆" if pnl >= 0 else "LOSS 💸"
+        close_reason_str = f"Market resolved — {result_label}"
+    elif close_reason.startswith("stop_loss_"):
         loss_pct = close_reason.replace("stop_loss_", "").replace("pct", "")
-        close_reason = f"Stop loss ({loss_pct}%)"
+        close_reason_str = f"Stop loss ({loss_pct}%)"
     else:
-        close_reason = reason_map.get(close_reason, close_reason.replace("_", " "))
+        reason_map = {"trader_exited": "Trader exited"}
+        close_reason_str = reason_map.get(close_reason, close_reason.replace("_", " "))
 
     return (
         f"{pnl_icon} <b>Position Closed</b>\n"
         f"🏪 {market_display}\n"
         f"{position.side}{outcome_str} entry @ {position.entry_price:.4f}\n"
         f"💵 P&L: <b>{pnl_sign}${pnl:.2f} ({pnl_sign}{pnl_pct:.1f}%)</b>\n"
-        f"📝 {close_reason}"
+        f"📝 {close_reason_str}"
     )
 
 

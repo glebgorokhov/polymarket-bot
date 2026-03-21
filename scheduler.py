@@ -183,6 +183,16 @@ def start_scheduler() -> AsyncIOScheduler:
         max_instances=1,
     )
 
+    # Check for resolved markets every 15 minutes — auto-close with correct P&L
+    scheduler.add_job(
+        executor.check_market_resolutions,
+        trigger=IntervalTrigger(minutes=15),
+        id="check_resolutions",
+        name="Auto-close positions in resolved markets",
+        replace_existing=True,
+        max_instances=1,
+    )
+
     # Update position prices every hour
     scheduler.add_job(
         executor.update_position_prices,

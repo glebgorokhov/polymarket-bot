@@ -294,26 +294,29 @@ async def execute_copy_trade(signal: Signal, mode: str) -> None:
         ))
 
 
-async def close_position(position: Position, reason: str) -> None:
+async def close_position(position: Position, reason: str, exit_price: Optional[float] = None) -> None:
     """
     Close an open position: record exit, notify.
 
     Args:
         position: Open Position ORM object to close.
-        reason: Human-readable close reason (e.g., "trader_exited", "stop_loss").
+        reason: Human-readable close reason (e.g., "trader_exited", "stop_loss", "market_resolved").
+        exit_price: If provided, skip CLOB midpoint lookup and use this price directly.
+                    Use 1.0 for winning resolved positions, 0.0 for losing ones.
     """
     clob_client = _get_clob_client()
 
-    try:
-        current_price = await clob_client.get_midpoint(token_id=position.token_id)
-    except Exception as exc:
-        logger.warning("Failed to get midpoint for close: %s", exc)
-        current_price = position.current_price or position.entry_price
+    if exit_price is None:
+        try:
+            exit_price = await clob_client.get_midpoint(token_id=position.token_id)
+        except Exception as exc:
+            logger.warning("Failed to get midpoint for close: %s", exc)
+            exit_price = position.current_price or position.entry_price
 
-    if not current_price or current_price <= 0:
-        current_price = position.entry_price
+    if not exit_price or exit_price < 0:
+        exit_price = position.entry_price
 
-    exit_value = (position.shares or 0) * current_price
+    exit_value = (position.shares or 0) * exit_price
 
     async with get_session() as session:
         position_repo = PositionRepo(session)
@@ -369,6 +372,76 @@ async def check_stop_losses() -> None:
                 await close_position(position, reason=f"stop_loss_{abs(loss_pct):.1f}pct")
         except Exception as exc:
             logger.error("Error checking stop loss for position %d: %s", position.id, exc)
+
+
+async def check_market_resolutions() -> None:
+    """
+    Check all open positions for resolved markets and auto-close them.
+
+    For each open position, fetches the CLOB market state. If closed=True,
+    determines the winner from the tokens list and closes the position with
+    exit_price=1.0 (win) or 0.0 (loss). Notifies for real positions.
+    """
+    async with get_session() as session:
+        position_repo = PositionRepo(session)
+        open_positions = list(await position_repo.get_open())
+
+    if not open_positions:
+        return
+
+    # Batch fetch CLOB market data for all unique condition IDs
+    import asyncio
+    import httpx
+
+    unique_cids = list({p.market_condition_id for p in open_positions})
+    market_data: dict[str, dict] = {}
+
+    async def _fetch(client: httpx.AsyncClient, cid: str) -> None:
+        try:
+            resp = await client.get(f"https://clob.polymarket.com/markets/{cid}", timeout=10)
+            if resp.status_code == 200:
+                market_data[cid] = resp.json()
+        except Exception as exc:
+            logger.debug("Resolution check fetch failed %s: %s", cid[:16], exc)
+
+    async with httpx.AsyncClient() as client:
+        await asyncio.gather(*[_fetch(client, cid) for cid in unique_cids])
+
+    closed_count = 0
+    for position in open_positions:
+        data = market_data.get(position.market_condition_id)
+        if not data or not data.get("closed", False):
+            continue
+
+        # Market is resolved — find if our token won
+        tokens = data.get("tokens") or []
+        winner = None
+        for tok in tokens:
+            if tok.get("token_id") == position.token_id:
+                winner = tok.get("winner", False)
+                break
+
+        if winner is None:
+            # token_id not found in market tokens — unusual, skip
+            logger.warning(
+                "Could not determine winner for position %d token %s",
+                position.id, position.token_id[:20],
+            )
+            continue
+
+        exit_price = 1.0 if winner else 0.0
+        pnl_sign = "✅" if winner else "❌"
+        logger.info(
+            "Market resolved: position %d %s %s → %s (exit_price=%.1f)",
+            position.id, position.side, position.market_condition_id[:16],
+            "WIN" if winner else "LOSS", exit_price,
+        )
+
+        await close_position(position, reason="market_resolved", exit_price=exit_price)
+        closed_count += 1
+
+    if closed_count:
+        logger.info("Auto-closed %d resolved position(s)", closed_count)
 
 
 async def update_position_prices() -> None:
