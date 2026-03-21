@@ -273,7 +273,25 @@ async def execute_copy_trade(signal: Signal, mode: str) -> None:
     # One consolidated notification
     if primary_position:
         from bot.notifications import trade_opened_multi, send_notification
-        await send_notification(trade_opened_multi(primary_position, triggered_slugs, mode))
+        _trader = getattr(signal, "trader", None)
+        _trader_name = getattr(_trader, "display_name", None) if _trader else None
+        _trader_addr = getattr(signal, "_trader_address", None)
+        _event_slug = getattr(signal, "_event_slug", None) or ""
+        _outcome = getattr(signal, "_outcome", None)
+        _end_date = getattr(signal, "_end_date", None)
+        # market_question: use signal's market_name if it looks like a real question
+        _mq = market_name if (market_name and not market_name.startswith("0x")) else None
+        await send_notification(trade_opened_multi(
+            primary_position,
+            triggered_slugs,
+            mode,
+            trader_name=_trader_name,
+            trader_address=_trader_addr,
+            event_slug=_event_slug,
+            outcome=_outcome,
+            end_date=_end_date,
+            market_question=_mq,
+        ))
 
 
 async def close_position(position: Position, reason: str) -> None:

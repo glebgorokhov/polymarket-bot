@@ -131,28 +131,76 @@ def trade_opened_multi(
     triggered_slugs: list,
     mode: str,
     trader_name: Optional[str] = None,
+    trader_address: Optional[str] = None,
     event_slug: Optional[str] = None,
+    outcome: Optional[str] = None,
+    end_date: Optional[Any] = None,
+    market_question: Optional[str] = None,
 ) -> str:
     """
     Notification when a position is opened, showing all strategies that triggered.
     """
+    from datetime import datetime, timezone as _tz
+
     mode_icon = "✅" if mode == "auto" else "📄"
     mode_label = "Trade placed" if mode == "auto" else "Paper trade"
     side_icon = "🟢" if position.side == "BUY" else "🔴"
 
     cond_id = getattr(position, "market_condition_id", "") or ""
-    market_url = f"https://polymarket.com/event/{event_slug or cond_id}"
-    market_display = (position.market_name or cond_id[:20])[:60]
 
-    trader_line = f"👤 Copying <b>{trader_name}</b>\n" if trader_name else ""
+    # Market question: prefer explicit arg, then position field (if not hex), then truncated ID
+    raw_name = market_question or position.market_name or ""
+    if raw_name.startswith("0x") or not raw_name:
+        raw_name = cond_id[:20] + "…"
+    market_display = raw_name[:65] + "…" if len(raw_name) > 65 else raw_name
+
+    # URL: event slug is much nicer than condition ID
+    _slug = event_slug or ""
+    market_url = f"https://polymarket.com/event/{_slug}" if _slug else f"https://polymarket.com/event/{cond_id}"
+
+    # Outcome (YES / NO / name)
+    _outcome = outcome or getattr(position, "outcome", None)
+    outcome_str = f" → <b>{_outcome}</b>" if _outcome else ""
+
+    # Trader line
+    if trader_name and trader_address:
+        trader_line = f"👤 <a href=\"https://polymarket.com/profile/{trader_address}\">{trader_name}</a>\n"
+    elif trader_name:
+        trader_line = f"👤 {trader_name}\n"
+    else:
+        trader_line = ""
+
+    # Close date
+    _end = end_date or getattr(position, "end_date", None)
+    close_str = ""
+    if _end:
+        now = datetime.now(_tz.utc)
+        if _end.tzinfo is None:
+            _end = _end.replace(tzinfo=_tz.utc)
+        days_left = (_end - now).days
+        if days_left == 0:
+            close_str = " · closes today"
+        elif days_left == 1:
+            close_str = " · closes tomorrow"
+        elif days_left > 1:
+            close_str = f" · closes in {days_left}d"
+
+    # Strategy label — shorten slugs to readable names
+    _strat_labels = {
+        "pure_follow": "Pure Follow",
+        "consensus": "Consensus",
+        "whale": "Whale",
+        "category_expert": "Category Expert",
+        "smart_exit": "Smart Exit",
+    }
+    strat_str = " + ".join(_strat_labels.get(s, s) for s in triggered_slugs)
 
     return (
         f"{mode_icon} <b>{mode_label}</b>\n"
         f"{trader_line}"
         f"🏪 <a href=\"{market_url}\">{market_display}</a>\n"
-        f"{side_icon} {position.side} @ <b>{position.entry_price:.3f}</b>  💵 ${position.size_usd:.2f}\n"
-        f"🎯 {' + '.join(triggered_slugs)}\n"
-        f"🆔 Position #{position.id}"
+        f"{side_icon} {position.side}{outcome_str} @ <b>{position.entry_price:.3f}</b>  💵 ${position.size_usd:.2f}{close_str}\n"
+        f"🎯 {strat_str}"
     )
 
 
@@ -265,12 +313,13 @@ def trade_opened(position: Any, strategy_name: str) -> str:
     )
 
 
-def trade_closed(position: Any) -> str:
+def trade_closed(position: Any, market_question: Optional[str] = None) -> str:
     """
     Format a message for when a position is closed.
 
     Args:
         position: Closed Position ORM object (has pnl, pnl_pct set).
+        market_question: Human-readable market question (overrides stored name if hex).
 
     Returns:
         Formatted notification string.
@@ -280,13 +329,32 @@ def trade_closed(position: Any) -> str:
     pnl_icon = "✅" if pnl >= 0 else "❌"
     pnl_sign = "+" if pnl >= 0 else ""
 
+    raw_name = market_question or position.market_name or ""
+    cond_id = getattr(position, "market_condition_id", "") or ""
+    if raw_name.startswith("0x") or not raw_name:
+        raw_name = cond_id[:20] + "…"
+    market_display = raw_name[:65] + "…" if len(raw_name) > 65 else raw_name
+
+    outcome = getattr(position, "outcome", None)
+    outcome_str = f" → <b>{outcome}</b>" if outcome else ""
+
+    reason_map = {
+        "trader_exited": "Trader exited",
+        "market_resolved": "Market resolved",
+    }
+    close_reason = position.close_reason or "unknown"
+    if close_reason.startswith("stop_loss_"):
+        loss_pct = close_reason.replace("stop_loss_", "").replace("pct", "")
+        close_reason = f"Stop loss ({loss_pct}%)"
+    else:
+        close_reason = reason_map.get(close_reason, close_reason.replace("_", " "))
+
     return (
         f"{pnl_icon} <b>Position Closed</b>\n"
-        f"🏪 {position.market_name}\n"
-        f"📈 {position.side} entry @ {position.entry_price:.4f}\n"
+        f"🏪 {market_display}\n"
+        f"{position.side}{outcome_str} entry @ {position.entry_price:.4f}\n"
         f"💵 P&L: <b>{pnl_sign}${pnl:.2f} ({pnl_sign}{pnl_pct:.1f}%)</b>\n"
-        f"📝 Reason: {position.close_reason}\n"
-        f"🆔 ID: {position.id}"
+        f"📝 {close_reason}"
     )
 
 
