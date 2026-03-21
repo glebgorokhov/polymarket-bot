@@ -203,6 +203,15 @@ async def execute_copy_trade(signal: Signal, mode: str) -> None:
                 is_primary = False  # fall through as shadow
 
         if is_primary and mode == "auto":
+            # Guard: don't attempt order if live balance can't cover it
+            if clob_balance < trade_size:
+                logger.info(
+                    "Skipping order — live balance $%.2f < trade size $%.2f",
+                    clob_balance, trade_size,
+                )
+                async with get_session() as session:
+                    await SignalRepo(session).update_action(signal.id, "skipped", f"insufficient_balance:{clob_balance:.2f}")
+                return
             try:
                 order_result = await clob_client.place_market_order(
                     token_id=signal.token_id,
