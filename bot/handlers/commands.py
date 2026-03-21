@@ -432,7 +432,7 @@ async def _build_positions_text() -> str:
     unique_cids = list({pos.market_condition_id for pos in real_positions})
     clob_data = await _fetch_clob_market_info(unique_cids)
 
-    lines = [f"📂 <b>Open Positions ({len(real_positions)} real)</b>\n"]
+    lines = [f"📂 <b>Open Positions ({len(real_positions)} real)</b>"]
 
     for pos in real_positions:
         current = pos.current_price or pos.entry_price
@@ -443,18 +443,19 @@ async def _build_positions_text() -> str:
         sign = "+" if pnl >= 0 else ""
         icon = "🟢" if pnl >= 0 else "🔴"
 
-        # ── Market question ──────────────────────────────────────────────────
+        # ── Market question + URL ────────────────────────────────────────────
         clob = clob_data.get(pos.market_condition_id) or {}
-        question = clob.get("question") or pos.market_name or pos.market_condition_id
-        # If market_name is a 0x hex (old style), prefer CLOB question
-        if pos.market_name and pos.market_name.startswith("0x"):
-            question = clob.get("question") or pos.market_condition_id[:20] + "…"
-        market_short = question[:60] + "…" if len(question) > 60 else question
+        question = clob.get("question") or pos.market_name or ""
+        if not question or question.startswith("0x"):
+            question = pos.market_condition_id[:24] + "…"
+        market_short = question[:65] + "…" if len(question) > 65 else question
+
+        market_slug = clob.get("market_slug") or pos.market_condition_id
+        market_url = f"https://polymarket.com/event/{market_slug}"
 
         # ── Outcome (YES / NO / name) ────────────────────────────────────────
-        outcome = pos.outcome  # populated for new positions
+        outcome = pos.outcome
         if not outcome and clob:
-            # Figure out from token_id which outcome this is
             tokens = clob.get("tokens") or []
             for tok in tokens:
                 if tok.get("token_id") == pos.token_id:
@@ -462,56 +463,61 @@ async def _build_positions_text() -> str:
                     break
         outcome_str = f" → <b>{outcome}</b>" if outcome else ""
 
-        # ── Close date ───────────────────────────────────────────────────────
-        end_date = pos.end_date
-        if not end_date and clob:
-            raw_end = clob.get("end_date_iso") or clob.get("end_date")
-            if raw_end:
-                try:
-                    end_date = datetime.fromisoformat(raw_end.replace("Z", "+00:00"))
-                except Exception:
-                    pass
-
-        if end_date:
-            now_utc = datetime.now(timezone.utc)
-            if end_date.tzinfo is None:
-                end_date = end_date.replace(tzinfo=timezone.utc)
-            days_left = (end_date - now_utc).days
-            if days_left < 0:
-                close_str = "⚠️ may have resolved"
-            elif days_left == 0:
-                close_str = "closes today"
-            elif days_left == 1:
-                close_str = "closes tomorrow"
-            else:
-                close_str = f"closes in {days_left}d"
+        # ── Close / resolved status ──────────────────────────────────────────
+        # Use CLOB closed flag as ground truth. end_date alone is unreliable.
+        is_closed = clob.get("closed", False)
+        if is_closed:
+            close_str = "✅ resolved — close this position"
         else:
+            end_date = pos.end_date
+            if not end_date:
+                raw_end = clob.get("end_date_iso") or clob.get("end_date")
+                if raw_end:
+                    try:
+                        end_date = datetime.fromisoformat(raw_end.replace("Z", "+00:00"))
+                    except Exception:
+                        pass
             close_str = ""
+            if end_date:
+                now_utc = datetime.now(timezone.utc)
+                if end_date.tzinfo is None:
+                    end_date = end_date.replace(tzinfo=timezone.utc)
+                days_left = (end_date - now_utc).days
+                if days_left == 0:
+                    close_str = "closes today"
+                elif days_left == 1:
+                    close_str = "closes tomorrow"
+                elif days_left > 1:
+                    close_str = f"closes in {days_left}d"
+                # days_left < 0 but not closed → end_date is stale, show nothing
 
         # ── Traders on this market ────────────────────────────────────────────
         addrs = market_to_traders.get(pos.market_condition_id, set())
-        traders_list = [trader_names[a] for a in addrs if a in trader_names]
-        traders_str = "traders: " + ", ".join(traders_list) if traders_list else ""
+        trader_parts = []
+        for addr in addrs:
+            name = trader_names.get(addr, addr[:10] + "…")
+            trader_parts.append(f'<a href="https://polymarket.com/profile/{addr}">{name}</a>')
+        traders_str = "👤 " + ", ".join(trader_parts) if trader_parts else ""
 
-        # ── Format line ───────────────────────────────────────────────────────
+        # ── Format block ──────────────────────────────────────────────────────
         cost_str = f"${entry_cost:.2f}" if entry_cost else "?"
-        line = (
-            f"{icon} <b>{market_short}</b>\n"
-            f"   {pos.side}{outcome_str} @ {pos.entry_price:.4f}"
-            f" · {cost_str} → <b>${current_value:.2f}</b> ({sign}{pnl_pct:.1f}%)"
-        )
+        meta = f"{cost_str} → <b>${current_value:.2f}</b> ({sign}{pnl_pct:.1f}%)"
         if close_str:
-            line += f" · {close_str}"
-        if traders_str:
-            line += f"\n   👤 {traders_str}"
+            meta += f" · {close_str}"
 
-        lines.append(line)
+        block = (
+            f"\n"
+            f"{icon} <a href=\"{market_url}\"><b>{market_short}</b></a>\n"
+            f"   {pos.side}{outcome_str} @ {pos.entry_price:.4f} · {meta}"
+        )
+        if traders_str:
+            block += f"\n   {traders_str}"
+
+        lines.append(block)
 
     if shadow_positions:
-        from collections import Counter
-        strat_counts: Counter = Counter(p.strategy_id for p in shadow_positions)
         total = len(shadow_positions)
-        lines.append(f"\n👁️ <i>{total} shadow positions (strategy A/B testing — not real money)</i>")
+        lines.append(f"\n👁️ <i>{total} shadow positions (strategy A/B testing)</i>")
 
     return "\n".join(lines)
 
