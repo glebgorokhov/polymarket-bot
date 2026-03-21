@@ -452,13 +452,23 @@ async def _build_positions_text() -> str:
                     end_dt = datetime.fromisoformat(raw_end.replace("Z", "+00:00"))
                     if end_dt.tzinfo is None:
                         end_dt = end_dt.replace(tzinfo=timezone.utc)
-                    days_left = (end_dt - datetime.now(timezone.utc)).days
-                    if days_left == 0:
-                        close_str = "closes today"
-                    elif days_left == 1:
-                        close_str = "closes tomorrow"
-                    elif days_left > 1:
-                        close_str = f"closes in {days_left}d"
+                    delta = end_dt - datetime.now(timezone.utc)
+                    total_seconds = int(delta.total_seconds())
+                    if total_seconds <= 0:
+                        pass  # stale end_date, skip
+                    elif total_seconds < 3600:
+                        close_str = f"closes in {total_seconds // 60}m"
+                    elif total_seconds < 86400:
+                        h = total_seconds // 3600
+                        m = (total_seconds % 3600) // 60
+                        close_str = f"closes in {h}h {m}m"
+                    elif total_seconds < 86400 * 2:
+                        h = (total_seconds - 86400) // 3600
+                        close_str = f"closes tomorrow {h}h"
+                    else:
+                        days = total_seconds // 86400
+                        h = (total_seconds % 86400) // 3600
+                        close_str = f"closes in {days}d {h}h"
                     # negative but not closed → stale end_date, skip
                 except Exception:
                     pass
