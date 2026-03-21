@@ -203,11 +203,11 @@ async def execute_copy_trade(signal: Signal, mode: str) -> None:
                 logger.error("Order placement failed: %s", exc)
                 from bot.notifications import error_alert, send_notification
                 await send_notification(error_alert(str(exc)))
-                # Mark signal as error and skip — do NOT create a shadow position
-                # for a failed real order (avoids phantom stop-loss notifications)
+                # Mark signal as error — do NOT create any position (real or shadow)
+                # A failed order means nothing happened on-chain, recording it is misleading
                 async with get_session() as session:
                     await SignalRepo(session).update_action(signal.id, "error", f"order_failed:{exc}")
-                continue
+                return  # abort entire signal — don't create shadow positions either
 
         is_shadow = not is_primary
 
