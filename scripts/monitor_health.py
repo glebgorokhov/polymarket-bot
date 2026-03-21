@@ -111,8 +111,7 @@ async def check(conn, check_num: int, start_time: datetime) -> str:
         lines.append(f"  {pnl_icon} Real: {real_pos['n']} pos, ${real_pos['total_usd']:.2f} deployed, avg {pnl:+.1f}%")
     else:
         lines.append(f"  Real: 0 open")
-    if shadow_pos:
-        lines.append(f"  👻 Shadow: {shadow_pos['n']} pos, ${shadow_pos['total_usd']:.2f}")
+    # Shadow positions intentionally hidden — they run in background for strategy comparison
 
     # 5. Recent trades placed (last 22 min)
     recent_trades = await conn.fetch("""

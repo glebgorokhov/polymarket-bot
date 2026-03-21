@@ -265,6 +265,9 @@ async def _process_trade(
     token_id = trade.get("asset_id") or trade.get("asset") or trade.get("tokenId") or ""
     outcome_index = int(trade.get("outcomeIndex", 0) or 0)
 
+    outcome_name: Optional[str] = trade.get("outcome") or None
+    end_date_raw: Optional[str] = None
+
     if not token_id and market_id:
         # Fetch token_id from CLOB market endpoint
         try:
@@ -278,11 +281,32 @@ async def _process_trade(
             tokens = _resp.get("tokens", [])
             if tokens and outcome_index < len(tokens):
                 token_id = tokens[outcome_index].get("token_id", "")
+                # Grab outcome name from token if not already in trade data
+                if not outcome_name:
+                    outcome_name = tokens[outcome_index].get("outcome") or None
                 if not market_name or market_name == "Unknown Market":
                     market_name = _resp.get("question", market_name)
+            # Grab end date
+            end_date_raw = _resp.get("end_date_iso") or _resp.get("end_date") or None
             logger.debug("Resolved token_id from CLOB for %s[%d]: %s", market_id[:16], outcome_index, token_id[:20] if token_id else "NONE")
         except Exception as exc:
             logger.warning("Failed to resolve token_id from CLOB: %s", exc)
+    elif market_id:
+        # We have a token_id already but may still want outcome name + end_date from CLOB
+        try:
+            import httpx as _httpx
+            _resp = await asyncio.to_thread(
+                lambda: _httpx.get(
+                    f"https://clob.polymarket.com/markets/{market_id}",
+                    timeout=10,
+                ).json()
+            )
+            tokens = _resp.get("tokens", [])
+            if not outcome_name and tokens and outcome_index < len(tokens):
+                outcome_name = tokens[outcome_index].get("outcome") or None
+            end_date_raw = _resp.get("end_date_iso") or _resp.get("end_date") or None
+        except Exception:
+            pass
 
     side = "BUY" if trade.get("side", "").upper() in ("BUY", "LONG") else "SELL"
     price = float(trade.get("price", trade.get("avgPrice", 0)) or 0)
@@ -356,6 +380,16 @@ async def _process_trade(
     signal.trader = trader  # type: ignore[attr-defined]
     signal._trader_address = trader.address  # type: ignore[attr-defined]
     signal._event_slug = event_slug  # type: ignore[attr-defined]
+    signal._outcome = outcome_name  # type: ignore[attr-defined]
+    # Parse end_date to datetime if available
+    signal._end_date = None  # type: ignore[attr-defined]
+    if end_date_raw:
+        try:
+            from datetime import datetime as _dt, timezone as _tz
+            if isinstance(end_date_raw, str):
+                signal._end_date = _dt.fromisoformat(end_date_raw.replace("Z", "+00:00"))  # type: ignore[attr-defined]
+        except Exception:
+            pass
 
     # Hand off to executor
     from core import executor

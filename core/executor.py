@@ -95,6 +95,8 @@ async def execute_copy_trade(signal: Signal, mode: str) -> None:
         recent_signals = list(await signal_repo.get_recent(hours=1))
         position_repo = PositionRepo(session)
         open_positions = list(await position_repo.get_open())
+        # Real positions only — used for risk checks (shadows don't consume real balance)
+        real_open_positions = [p for p in open_positions if not p.is_shadow]
 
     market_name = getattr(signal, "market_name", None) or signal.market_condition_id
 
@@ -169,12 +171,12 @@ async def execute_copy_trade(signal: Signal, mode: str) -> None:
         is_primary = (strat_orm.slug == primary_slug)
         shares = trade_size / signal.price if signal.price > 0 else 0
 
-        # Risk check only for primary
+        # Risk check only for primary — use real positions only (not shadows)
         if is_primary:
             ok, risk_reason = await risk.check_risk_limits(
                 market_condition_id=signal.market_condition_id,
                 proposed_size=trade_size,
-                open_positions=open_positions,
+                open_positions=real_open_positions,
                 total_balance=balance,
                 settings=settings,
             )
@@ -208,6 +210,26 @@ async def execute_copy_trade(signal: Signal, mode: str) -> None:
                 continue
 
         is_shadow = not is_primary
+
+        # Shadow position cap: avoid unbounded accumulation.
+        # Default: max 50 shadow positions per strategy.
+        _max_shadow = int(settings.get("max_shadow_per_strategy", "50"))
+        if is_shadow:
+            shadow_count = sum(
+                1 for p in open_positions
+                if p.is_shadow and p.strategy_id == strat_orm.id
+            )
+            if shadow_count >= _max_shadow:
+                logger.debug(
+                    "Shadow cap reached for strategy %s (%d/%d) — skipping",
+                    strat_orm.slug, shadow_count, _max_shadow,
+                )
+                continue
+
+        outcome = getattr(signal, "_outcome", None)
+        end_date = getattr(signal, "_end_date", None)
+        trader_addr = getattr(signal, "_trader_address", None)
+
         async with get_session() as session:
             position_repo = PositionRepo(session)
             execution_repo = ExecutionRepo(session)
@@ -223,6 +245,9 @@ async def execute_copy_trade(signal: Signal, mode: str) -> None:
                 signal_id=signal.id,
                 entry_cost=trade_size,
                 is_shadow=is_shadow,
+                outcome=outcome,
+                end_date=end_date,
+                trader_address=trader_addr,
             )
             if not is_shadow:
                 _order_id = order_id if mode == "auto" else f"paper_{signal.id}"

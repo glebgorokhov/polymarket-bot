@@ -375,10 +375,37 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def _build_positions_text() -> str:
     """Build positions summary string (real positions only, shadow count shown separately)."""
+    from collections import defaultdict
+    from db.repos.signals import SignalRepo
+    from db.repos.traders import TraderRepo
+
     async with get_session() as session:
         position_repo = PositionRepo(session)
         real_positions = list(await position_repo.get_open(is_shadow=False))
         shadow_positions = list(await position_repo.get_open(is_shadow=True))
+
+        # Build a map of market → trader names (from other open positions sharing same market)
+        market_traders: dict[str, list[str]] = defaultdict(list)
+        for pos in real_positions:
+            if pos.trader_address:
+                market_traders[pos.market_condition_id].append(pos.trader_address)
+
+        # Also look up which signal traders are in each market (from shadow positions on same market)
+        for pos in shadow_positions:
+            if pos.trader_address and pos.trader_address not in market_traders.get(pos.market_condition_id, []):
+                market_traders[pos.market_condition_id].append(pos.trader_address)
+
+        # Fetch display names for all referenced trader addresses
+        all_addresses = {addr for addrs in market_traders.values() for addr in addrs}
+        trader_names: dict[str, str] = {}
+        if all_addresses:
+            trader_repo = TraderRepo(session)
+            for addr in all_addresses:
+                t = await trader_repo.get_by_address(addr)
+                if t:
+                    trader_names[addr] = t.display_name or addr[:10] + "…"
+                else:
+                    trader_names[addr] = addr[:10] + "…"
 
     if not real_positions and not shadow_positions:
         return "📂 No open positions."
@@ -392,13 +419,61 @@ async def _build_positions_text() -> str:
         pnl_pct = (pnl / entry_cost * 100) if entry_cost > 0 else 0
         sign = "+" if pnl >= 0 else ""
         icon = "🟢" if pnl >= 0 else "🔴"
-        market_short = pos.market_name[:35] + "..." if len(pos.market_name) > 35 else pos.market_name
-        lines.append(
+
+        # Market question (full name, then truncate)
+        market_short = pos.market_name[:55] + "…" if len(pos.market_name) > 55 else pos.market_name
+
+        # Outcome: what did we bet on?
+        outcome_str = f" [{pos.outcome}]" if pos.outcome else ""
+
+        # Close date
+        if pos.end_date:
+            now = datetime.now(timezone.utc)
+            end = pos.end_date
+            if end.tzinfo is None:
+                from datetime import timezone as _tz
+                end = end.replace(tzinfo=_tz.utc)
+            days_left = (end - now).days
+            if days_left < 0:
+                close_str = "⚠️ resolved"
+            elif days_left == 0:
+                close_str = "closes today"
+            elif days_left == 1:
+                close_str = "closes tomorrow"
+            else:
+                close_str = f"closes in {days_left}d"
+        else:
+            close_str = ""
+
+        # Which traders are on this market
+        addrs = market_traders.get(pos.market_condition_id, [])
+        traders_on_market = [trader_names[a] for a in addrs if a in trader_names]
+        traders_str = f" · traders: {', '.join(traders_on_market)}" if traders_on_market else ""
+
+        # Entry cost and current value
+        cost_str = f"${entry_cost:.2f} in" if entry_cost else ""
+
+        line = (
             f"{icon} <b>{market_short}</b>\n"
-            f"   {pos.side} @ {pos.entry_price:.4f} | Now: ${current_value:.2f} ({sign}{pnl_pct:.1f}%)"
+            f"   {pos.side}{outcome_str} @ {pos.entry_price:.4f}"
+            f" | {cost_str} → <b>${current_value:.2f}</b> ({sign}{pnl_pct:.1f}%)"
         )
+        if close_str:
+            line += f" · {close_str}"
+        if traders_str:
+            line += f"\n  {traders_str}"
+
+        lines.append(line)
+
     if shadow_positions:
-        lines.append(f"\n👁️ <i>{len(shadow_positions)} shadow simulation position(s) running in background</i>")
+        # Group shadow positions by strategy for a cleaner summary
+        from collections import Counter
+        strat_counts: Counter = Counter()
+        for p in shadow_positions:
+            strat_counts[p.strategy_id or 0] += 1
+        total = len(shadow_positions)
+        lines.append(f"\n👁️ <i>{total} shadow simulation position(s) running (strategy comparison)</i>")
+
     return "\n".join(lines)
 
 

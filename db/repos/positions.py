@@ -30,6 +30,9 @@ class PositionRepo:
         signal_id: Optional[int] = None,
         entry_cost: Optional[float] = None,
         is_shadow: bool = False,
+        outcome: Optional[str] = None,
+        end_date=None,
+        trader_address: Optional[str] = None,
     ) -> Position:
         """Insert a new open position."""
         position = Position(
@@ -46,6 +49,9 @@ class PositionRepo:
             signal_id=signal_id,
             entry_cost=entry_cost,
             is_shadow=is_shadow,
+            outcome=outcome,
+            end_date=end_date,
+            trader_address=trader_address,
         )
         self._session.add(position)
         await self._session.flush()

@@ -167,6 +167,9 @@ class Position(Base):
     exit_value: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     pnl: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     pnl_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    outcome: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)      # e.g. "Yes", "No", outcome name
+    end_date: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)  # market close date
+    trader_address: Mapped[Optional[str]] = mapped_column(String(42), nullable=True)  # which trader triggered this
 
     strategy: Mapped[Optional["Strategy"]] = relationship("Strategy")
     signal: Mapped[Optional["Signal"]] = relationship("Signal", back_populates="positions")
