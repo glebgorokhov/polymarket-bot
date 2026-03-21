@@ -71,15 +71,19 @@ async def execute_copy_trade(signal: Signal, mode: str) -> None:
         logger.error("Failed to get balance: %s", exc)
         clob_balance = 0.0
 
-    if clob_balance < 1.0:
-        db_budget = float(settings.get("budget_total", cfg.default_budget_total))
+    # Use budget_total (fixed portfolio size) for exposure/risk calculations.
+    # Using live CLOB balance causes false risk alerts as money gets deployed
+    # (e.g. 3rd trade at 60% limit hits because denominator shrank).
+    db_budget = float(settings.get("budget_total", cfg.default_budget_total))
+    if clob_balance < 1.0 or db_budget <= 0:
         logger.warning(
-            "CLOB balance $%.2f < $1 — using DB budget_total $%.2f for strategy evaluation",
+            "CLOB balance $%.2f, DB budget $%.2f — using higher value",
             clob_balance, db_budget,
         )
-        balance = db_budget
+        balance = max(clob_balance, db_budget)
     else:
-        balance = clob_balance
+        # Portfolio total = deployed + available; use budget_total as stable reference
+        balance = db_budget
 
     per_trade_pct = float(settings.get("budget_per_trade_pct", cfg.default_per_trade_pct))
     max_trade_usd = float(settings.get("max_trade_usd", cfg.default_max_trade_usd))
