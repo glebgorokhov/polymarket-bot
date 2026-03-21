@@ -8,8 +8,8 @@ Create Date: 2026-03-21
 from alembic import op
 import sqlalchemy as sa
 
-revision = "0007_position_outcome_enddate"
-down_revision = "0006_trader_pnl_snapshots"
+revision = "0007"
+down_revision = "0006"
 branch_labels = None
 depends_on = None
 
